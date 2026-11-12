@@ -44,6 +44,26 @@ Actions:
 
 Each action appends a timestamped `🤖 Agent …` entry to the card's Markdown description.
 
+## Telegram bot
+
+The bot runs inside the backend process. It shares the SQLite pool and the WebSocket broadcast, so anything you do in Telegram shows up on the web board right away.
+
+```bash
+cp backend/.env.example backend/.env   # set TELEGRAM_BOT_TOKEN and TELEGRAM_ALLOWED_CHAT_ID
+cd backend && cargo run                # log: "telegram bot @YourBot online (chat … only)"
+```
+
+Without a token, the backend logs a warning and runs without the bot.
+
+| In Telegram | Effect |
+|---|---|
+| `/start`, `/help` | Shows help and a menu: 📋 View Board · ➕ Quick Add · ⚖️ Build/Sell Ratio |
+| `/board`, `/tasks` | Sends one compact board message. Tap a card, then use ▶ Build / 📣 Sell / ✅ Done / 🤖 Assign Agent / 🗑 Delete. Each tap edits that message in place. |
+| `/add <title>` or any plain text | Creates a card in Backlog. `#build` `#sell` `#ops` set the tag (default build). `>build` / `>sell` pick the column. `@agent` assigns it to the agent. Extra lines become the description. |
+| `/ratio` | Shows `Build: X% \| Sell: Y%` for Done cards, with a nudge when Build is above 75%. |
+
+When an agent calls `/api/agent/action` with `"action":"complete"`, the bot sends `🤖 Agent completed: "…" -> Moved to Done.` with a **↩️ Reopen to Build** button. The notification goes to `TELEGRAM_ALLOWED_CHAT_ID`. If that isn't set, it goes to the last chat that messaged the bot.
+
 ## API
 
 | Method | Path | Body |

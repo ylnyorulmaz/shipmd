@@ -2,6 +2,8 @@ mod db;
 mod error;
 mod models;
 mod routes;
+mod service;
+mod telegram;
 mod ws;
 
 use std::net::SocketAddr;
@@ -21,6 +23,8 @@ pub struct AppState {
     pub pool: SqlitePool,
     pub events: broadcast::Sender<String>,
     pub board_title: String,
+    /// Present when TELEGRAM_BOT_TOKEN is configured; used for outbound agent notifications.
+    pub telegram: Option<telegram::Telegram>,
 }
 
 impl AppState {
@@ -40,6 +44,8 @@ pub fn now() -> String {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Load backend/.env if present (real env vars win).
+    let _ = dotenvy::dotenv();
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info,sqlx=warn")),
@@ -52,7 +58,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let pool = db::connect(&db_path).await?;
     let (events, _) = broadcast::channel(256);
-    let state = AppState { pool, events, board_title };
+    let telegram = telegram::Telegram::from_env();
+    let state = AppState { pool, events, board_title, telegram };
+
+    // Telegram long-polling runs beside the web server on the same state:
+    // same SQLite pool, same WebSocket broadcast channel.
+    if let Some(bot) = state.telegram.clone() {
+        tokio::spawn(telegram::run(bot, state.clone()));
+    }
 
     let app = Router::new()
         .route("/api/board", get(routes::get_board))

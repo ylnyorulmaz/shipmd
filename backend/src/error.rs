@@ -32,4 +32,15 @@ impl IntoResponse for AppError {
     }
 }
 
+impl std::fmt::Display for AppError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AppError::NotFound(m) | AppError::BadRequest(m) => f.write_str(m),
+            AppError::Db(e) => write!(f, "database error: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for AppError {}
+
 pub type AppResult<T> = Result<T, AppError>;
