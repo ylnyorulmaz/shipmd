@@ -220,7 +220,12 @@ pub async fn update_card(state: &AppState, id: &str, patch: PatchCard, origin: O
             card.column_id = col;
             moved = true;
             if patch.position.is_none() {
-                card.position = end_position(state, &card.column_id).await?;
+                // Done is newest-first; every other column appends.
+                card.position = if card.column_id == DONE_COLUMN {
+                    top_position(state, &card.column_id).await?
+                } else {
+                    end_position(state, &card.column_id).await?
+                };
             }
         }
     }
@@ -264,7 +269,7 @@ pub async fn delete_card(state: &AppState, id: &str, origin: Option<String>) -> 
 }
 
 /// Resolve a full id or a unique short prefix (the 8-char id shown in the UI).
-async fn resolve_card(state: &AppState, key: &str) -> AppResult<Card> {
+pub async fn resolve_card(state: &AppState, key: &str) -> AppResult<Card> {
     let key = key.trim().to_ascii_lowercase();
     if key.len() < 4 || !key.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
         return Err(AppError::BadRequest(

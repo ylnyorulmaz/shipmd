@@ -221,6 +221,16 @@ pub async fn notify_agent_completed(bot: Telegram, card: Card) {
     notify_telegram(&bot, chat_id, &text, Some(keyboard)).await;
 }
 
+/// Send `text` (HTML) plus the card's action buttons to the notification chat.
+/// Used by the MCP tools ("agent started …", "moved … to Done").
+pub async fn notify_card(bot: Telegram, text: String, card: Card) {
+    let Some(chat_id) = bot.notify_chat() else {
+        tracing::info!("no Telegram chat known yet — send /start to the bot to receive notifications");
+        return;
+    };
+    notify_telegram(&bot, chat_id, &text, Some(card_keyboard(&card))).await;
+}
+
 // ---------------------------------------------------------------------------
 // Polling loop
 // ---------------------------------------------------------------------------
@@ -546,7 +556,7 @@ async fn handle_callback(
 // Rendering
 // ---------------------------------------------------------------------------
 
-fn esc(s: &str) -> String {
+pub fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 

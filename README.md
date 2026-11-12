@@ -64,6 +64,32 @@ Without a token, the backend logs a warning and runs without the bot.
 
 When an agent calls `/api/agent/action` with `"action":"complete"`, the bot sends `🤖 Agent completed: "…" -> Moved to Done.` with a **↩️ Reopen to Build** button. The notification goes to `TELEGRAM_ALLOWED_CHAT_ID`. If that isn't set, it goes to the last chat that messaged the bot.
 
+## MCP server (for Claude Code, Cursor, Windsurf, Cline)
+
+The backend has an MCP server built in. It speaks JSON-RPC 2.0 over two transports:
+- **Streamable HTTP** at `POST /mcp`
+- **Legacy HTTP+SSE** at `GET /mcp/sse` with `POST /mcp/messages`
+
+The tools go through the same service layer as everything else. Agent changes show up live on the board, and some also notify Telegram.
+
+| Tool | What it does |
+|---|---|
+| `get_board` | Returns columns and cards (`column` filter optional). Done is capped at the 10 most recent cards. |
+| `create_card` | `title` (required), plus `description`, `column` (default Backlog), `tag` (default build), `assignee` (default agent). |
+| `move_card` | `card_id` (full UUID or 8-char short id) and `target_column`. Moving to Done notifies Telegram. |
+| `update_card_notes` | `card_id` and `note`. `append` defaults to true and adds a timestamped entry; false replaces the description. |
+| `pick_next_agent_task` | Returns the agent's card that is already in Build if there is one. Otherwise it moves the top agent card in Backlog to Build and notifies Telegram. |
+
+Auth: if `MCP_API_KEY` is set, clients must send `Authorization: Bearer <key>`. If it is unset, only localhost can connect, and browser requests from other origins are rejected.
+
+```json
+{ "mcpServers": { "ship-board": {
+  "type": "http",
+  "url": "http://localhost:3001/mcp",
+  "headers": { "Authorization": "Bearer ${MCP_API_KEY}" }
+} } }
+```
+
 ## API
 
 | Method | Path | Body |

@@ -1,5 +1,6 @@
 mod db;
 mod error;
+mod mcp;
 mod models;
 mod routes;
 mod service;
@@ -76,13 +77,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/api/agent/action", post(routes::agent_action))
         .route("/ws", get(ws::handler))
-        .layer(CorsLayer::permissive())
-        .with_state(state);
+        .with_state(state.clone())
+        .merge(mcp::router(state))
+        .layer(CorsLayer::permissive());
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("board api on http://{addr}  (db: {db_path}, ws: /ws)");
-    axum::serve(listener, app)
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
         })
