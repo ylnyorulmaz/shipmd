@@ -23,7 +23,7 @@ frontend/  SolidJS · TypeScript · Vite · Tailwind CSS v4
 | Feature | Details |
 |---|---|
 | **Board** | Classic Trello look (gray lists, white cards) with light and dark themes. Each card has a title, a Markdown description, a tag (`build` / `sell` / `ops`) and an assignee (`👤 Me` / `🤖 Agent`). |
-| **Drag and drop** | Native HTML5 drag and drop within and across columns, with a drop placeholder. Hovering doesn't re-render the board. |
+| **Drag and drop** | Pointer-based dragging within and across columns. The card lifts with a Trello-style tilt and swings with momentum. Other cards slide aside, the card glides into its slot on release, and `Esc` sends it back. Columns auto-scroll near the edges, and hovering doesn't re-render the board. |
 | **Optimistic UI** | Every edit shows immediately and syncs in the background. If the server rejects it, the change is undone and a toast appears. |
 | **Real-time sync** | A WebSocket (`/ws`) sends every change. Cards moved by an agent, the bot or another tab slide to their new spot on screen. |
 | **Build vs. Sell bar** | The header shows the build/sell split of cards in Done. It warns when Build is above 75%. |
@@ -184,7 +184,8 @@ backend/src/
   error.rs      AppError → JSON HTTP errors
 frontend/src/
   store.ts      Solid store, optimistic changes, WebSocket sync, remote-move animation
-  dnd.ts        Drag and drop state and drop-position math
+  dnd.ts        Pointer drag: ghost, tilt, auto-scroll, drop target, glide-in drop
+  flip.ts       FLIP helper that slides cards to their new positions
   api.ts        fetch wrapper (adds X-Client-Id), WebSocket URL
   components/   Header (ratio bar, theme), BoardColumn, CardItem, Composer, CardModal
 ```
@@ -229,7 +230,7 @@ Other hosts work too: a small VPS (run the image with a volume), or Render on a 
 
 ## Known limitations
 
-- Desktop only for drag and drop. HTML5 drag and drop doesn't work on touch screens.
+- Dragging needs a mouse or pen. Touch dragging isn't supported yet; tapping a card still opens it.
 - Positions are floats, and dropping between two cards uses their midpoint. After thousands of reorders in the same spot, precision runs out. There's no rebalancing yet.
 - `pick_next_agent_task` doesn't claim cards atomically. Two agents calling it at the same moment can get the same card.
 - `start` from `/api/agent/action` sends sell-tagged cards to Sell, but `pick_next_agent_task` always moves cards to Build.

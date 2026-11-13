@@ -41,7 +41,8 @@ Run locally with `cd backend && cargo run` (port 3001) and `cd frontend && npm r
 | `backend/src/auth.rs` | Optional `BOARD_PASSWORD` guard: Basic auth, then an HttpOnly session cookie. Also `constant_time_eq`, which MCP reuses. |
 | `Dockerfile`, `fly.toml` | Single image (frontend build + Rust binary) and Fly.io config: one always-on machine, volume at `/data`. |
 | `frontend/src/store.ts` | Global Solid store, optimistic mutations with rollback, WebSocket client, FLIP animation for remote moves. |
-| `frontend/src/dnd.ts` | Drag and drop state (`createSelector`-based) and drop-position math. |
+| `frontend/src/dnd.ts` | Pointer-event drag and drop: ghost clone with tilt and momentum, auto-scroll, drop target (`createSelector`), glide-in drop, Esc to cancel. |
+| `frontend/src/flip.ts` | `flip(scope, mutate)`: measure cards, change the DOM, animate them from their old positions. Used by drag and drop and by remote events. |
 | `frontend/src/components/*` | `Header` (ratio bar, theme), `BoardColumn`, `CardItem`, `Composer`, `CardModal`. |
 
 ## Rules that must hold
@@ -77,7 +78,12 @@ Run locally with `cd backend && cargo run` (port 3001) and `cd frontend && npm r
 
 1. **Change cards in place** with `setBoard('cards', id, {...})`. Never replace the whole `cards` object or a card object, except through `reconcile` in `loadBoard`. `<For>` keys on object identity, and replacing objects re-renders the board.
 2. **Follow the optimistic pattern** (`moveCard`, `updateCard`, `createCard`, `deleteCard`): update the store, call the API, roll back and `showToast` on failure. New cards get a client-side UUID so the optimistic card and the server's card are the same object.
-3. **Drag and drop must not re-render the board while hovering.** The drop target is one primitive key read through `createSelector`. Keep it that way.
+3. **Drag and drop must not re-render the board while hovering.**
+   - It uses pointer events, not native HTML5 drag and drop.
+   - The drop target is one primitive key read through `createSelector`, updated inside `flip()` so siblings slide.
+   - Hit-testing uses `offsetTop`, which ignores running animations, so sliding cards can't make the target flicker.
+   - Cards need `data-card-id`, columns `data-column-id`, the scroll list `data-list` (positioned `relative`), and the slot `data-placeholder`. Keep these attributes.
+   - Respect `prefers-reduced-motion` via `prefersReducedMotion()`.
 4. **Sanitize Markdown.** Render it only through `renderMarkdown()`, which uses DOMPurify, because agents and Telegram write descriptions too.
 5. **Styling:** Tailwind v4 utility classes, with `dark:` variants keyed on the `.dark` class on `<html>`. There's no `tailwind.config`; theme tokens are in `src/index.css`.
 
@@ -86,7 +92,7 @@ Run locally with `cd backend && cargo run` (port 3001) and `cd frontend && npm r
 - **Backend over HTTP:** start with a scratch DB, then use `curl` for `/api/*`. To watch events, open `ws://localhost:3001/ws` with any WebSocket client (Node 22 has a global `WebSocket`).
 - **Telegram without Telegram:** set `TELEGRAM_BOT_TOKEN=TEST` and `TELEGRAM_API_URL=http://127.0.0.1:<port>`, and point it at a small fake server. The fake must answer `POST /botTEST/<method>` with `{"ok":true,"result":…}` and serve queued updates on `getUpdates`.
 - **MCP:** `curl` JSON-RPC to `POST /mcp` (see README). For real client compatibility, test with `@modelcontextprotocol/sdk`'s `StreamableHTTPClientTransport` and `SSEClientTransport`.
-- **UI:** Playwright drives native drag and drop (`locator.dragTo`) in Chromium. Open two pages to check real-time sync.
+- **UI:** Playwright drives the pointer drag with `page.mouse.down()` / `move(…, { steps })` / `up()`; `locator.dragTo` also works. Open two pages to check real-time sync.
 
 ## Using the board yourself (MCP)
 

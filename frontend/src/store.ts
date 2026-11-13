@@ -1,6 +1,7 @@
 import { createSignal } from 'solid-js';
 import { createStore, produce, reconcile } from 'solid-js/store';
 import { api, CLIENT_ID, uuid, wsUrl } from './api';
+import { flip, prefersReducedMotion } from './flip';
 import type { Assignee, Card, CardPatch, Column, Tag, WsEvent } from './types';
 
 export const GAP = 1024;
@@ -160,8 +161,14 @@ function removeLocal(id: string) {
 // Real-time sync
 // ---------------------------------------------------------------------------
 
-const prefersReducedMotion = () => matchMedia('(prefers-reduced-motion: reduce)').matches;
 const cardEl = (id: string) => document.querySelector<HTMLElement>(`[data-card-id="${CSS.escape(id)}"]`);
+
+/** Play the highlight; restarts it if the card is still flashing from an earlier update. */
+function flash(el: HTMLElement) {
+  el.classList.remove('card-flash');
+  void el.offsetWidth; // force reflow so the CSS animation starts over
+  el.classList.add('card-flash');
+}
 
 /**
  * FLIP-style glide for moves that come from elsewhere (an agent, curl, another tab).
@@ -172,16 +179,16 @@ function animateRemoteMove(id: string, mutate: () => void) {
   const before = cardEl(id);
   const first = before?.getBoundingClientRect();
   const ghost = before?.cloneNode(true) as HTMLElement | undefined;
-  mutate(); // Solid updates the DOM synchronously here.
+  flip(document, mutate, { exclude: id }); // siblings slide; Solid updates the DOM synchronously
   const after = cardEl(id);
   if (!after) return;
   if (!first || !ghost || prefersReducedMotion()) {
-    after.classList.add('card-flash');
+    flash(after);
     return;
   }
   const last = after.getBoundingClientRect();
   if (Math.abs(first.left - last.left) < 1 && Math.abs(first.top - last.top) < 1) {
-    after.classList.add('card-flash');
+    flash(after);
     return;
   }
   Object.assign(ghost.style, {
@@ -211,9 +218,7 @@ function animateRemoteMove(id: string, mutate: () => void) {
   const finish = () => {
     ghost.remove();
     after.style.visibility = '';
-    after.classList.remove('card-flash');
-    void after.offsetWidth; // restart the CSS animation
-    after.classList.add('card-flash');
+    flash(after);
   };
   anim.onfinish = finish;
   anim.oncancel = finish;
@@ -229,7 +234,7 @@ function applyEvent(ev: WsEvent) {
     case 'CARD_DELETED':
       if (ev.origin === CLIENT_ID) return;
       if (openCardId() === ev.id) setOpenCardId(null);
-      removeLocal(ev.id);
+      flip(document, () => removeLocal(ev.id));
       return;
     case 'CARD_CREATED':
     case 'CARD_MOVED':
@@ -237,7 +242,7 @@ function applyEvent(ev: WsEvent) {
       if (ev.origin === CLIENT_ID) return;
       const existing = board.cards[ev.card.id];
       if (!existing) {
-        setBoard('cards', ev.card.id, ev.card);
+        flip(document, () => setBoard('cards', ev.card.id, ev.card));
         requestAnimationFrame(() => cardEl(ev.card.id)?.classList.add('card-enter'));
         return;
       }
