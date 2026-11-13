@@ -1,0 +1,40 @@
+# Fly.io config for Ship Board. Deploy with `fly deploy`.
+# Runs exactly ONE always-on machine: WebSocket events are in memory, Telegram allows one
+# poller, and SQLite lives on the volume below.
+
+app = "shipmd"
+primary_region = "ams"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PORT = "8080"
+  BOARD_DB = "/data/board.db"
+  STATIC_DIR = "/app/static"
+  RUST_LOG = "info,sqlx=warn"
+
+# SQLite lives here. Created by `fly launch` / `fly deploy` if missing.
+[[mounts]]
+  source = "shipmd_data"
+  destination = "/data"
+  initial_size = "1gb"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # Never stop: the Telegram bot and WebSockets need a running process.
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    method = "GET"
+    path = "/healthz"
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "10s"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

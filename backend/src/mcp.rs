@@ -91,10 +91,6 @@ pub fn router(app: AppState) -> Router {
 // Auth guard
 // ---------------------------------------------------------------------------
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
-
 fn is_local_origin(origin: &str) -> bool {
     let host = origin.split("://").nth(1).unwrap_or(origin);
     let host = host.split('/').next().unwrap_or(host);
@@ -116,7 +112,7 @@ async fn auth(
             .and_then(|v| v.strip_prefix("Bearer "))
             .map(str::trim)
             .unwrap_or_default();
-        if !constant_time_eq(presented.as_bytes(), key.as_bytes()) {
+        if !crate::auth::constant_time_eq(presented.as_bytes(), key.as_bytes()) {
             return (
                 StatusCode::UNAUTHORIZED,
                 [(header::WWW_AUTHENTICATE, "Bearer")],

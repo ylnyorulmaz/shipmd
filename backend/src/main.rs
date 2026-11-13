@@ -1,3 +1,4 @@
+mod auth;
 mod db;
 mod error;
 mod mcp;
@@ -7,16 +8,20 @@ mod service;
 mod telegram;
 mod ws;
 
-use std::net::SocketAddr;
+use std::{net::SocketAddr, path::PathBuf};
 
 use axum::{
+    middleware,
     routing::{get, patch, post},
     Router,
 };
 use serde_json::{json, Value};
 use sqlx::SqlitePool;
 use tokio::sync::broadcast;
-use tower_http::cors::CorsLayer;
+use tower_http::{
+    cors::CorsLayer,
+    services::{ServeDir, ServeFile},
+};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Clone)]
@@ -68,7 +73,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::spawn(telegram::run(bot, state.clone()));
     }
 
-    let app = Router::new()
+    // Board routes: REST API, WebSocket and (in production) the built frontend.
+    let mut board = Router::new()
         .route("/api/board", get(routes::get_board))
         .route("/api/cards", post(routes::create_card))
         .route(
@@ -77,7 +83,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/api/agent/action", post(routes::agent_action))
         .route("/ws", get(ws::handler))
-        .with_state(state.clone())
+        .with_state(state.clone());
+
+    // STATIC_DIR (e.g. frontend/dist) is served when it exists; unknown paths get index.html.
+    let static_dir = std::env::var("STATIC_DIR").map(PathBuf::from).ok().filter(|d| d.join("index.html").is_file());
+    if let Some(dir) = &static_dir {
+        tracing::info!("serving frontend from {}", dir.display());
+        board = board.fallback_service(ServeDir::new(dir).fallback(ServeFile::new(dir.join("index.html"))));
+    }
+
+    // Optional BOARD_PASSWORD guard over the board routes (/mcp has its own auth).
+    let board = board.layer(middleware::from_fn_with_state(auth::BoardAuth::from_env(), auth::require));
+
+    let app = Router::new()
+        .route("/healthz", get(|| async { "ok" }))
+        .merge(board)
         .merge(mcp::router(state))
         .layer(CorsLayer::permissive());
 

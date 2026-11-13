@@ -74,6 +74,8 @@ The backend reads environment variables and loads `backend/.env` if it exists. R
 | `BOARD_DB` | `board.db` | SQLite file path; created and seeded if missing |
 | `BOARD_TITLE` | `Ship Board` | Board name in the UI and in Telegram |
 | `RUST_LOG` | `info,sqlx=warn` | Log level |
+| `BOARD_PASSWORD` | — | If set, the web UI, `/api` and `/ws` need this password: HTTP Basic with any username, then a session cookie. **Required when public.** |
+| `STATIC_DIR` | — | Folder with the built frontend (`frontend/dist`). If set, the backend serves the UI itself. |
 | `TELEGRAM_BOT_TOKEN` | — | Bot token from @BotFather. If unset, the bot is off. |
 | `TELEGRAM_ALLOWED_CHAT_ID` | — | Your numeric chat id. If set, the bot ignores every other chat. **Set this.** |
 | `TELEGRAM_API_URL` | `https://api.telegram.org` | Override for a self-hosted Bot API server or for tests |
@@ -158,6 +160,7 @@ curl -s localhost:3001/mcp -H 'Content-Type: application/json' -H "Authorization
 | POST | `/api/agent/action` | `{ card_id, action: "start" \| "complete" \| "note", note? }` |
 | WS | `/ws` | Server → client: `{ type, card \| id, origin }` |
 | POST | `/mcp` | MCP JSON-RPC 2.0 (Streamable HTTP) |
+| GET | `/healthz` | `ok`, no auth (for health checks) |
 | GET / POST | `/mcp/sse`, `/mcp/messages?sessionId=` | MCP legacy SSE transport |
 
 - **WebSocket event types:** `CARD_CREATED`, `CARD_MOVED`, `CARD_UPDATED`, `CARD_DELETED`. The server also sends `HELLO` on connect and `RESYNC` when a client falls behind and should reload the board.
@@ -169,7 +172,8 @@ curl -s localhost:3001/mcp -H 'Content-Type: application/json' -H "Authorization
 
 ```
 backend/src/
-  main.rs       Startup: config, SQLite, router, Telegram task, CORS
+  main.rs       Startup: config, SQLite, router, static frontend, Telegram task, CORS
+  auth.rs       Optional BOARD_PASSWORD guard (Basic auth → session cookie)
   service.rs    All card logic: validate → SQLite → WebSocket broadcast (shared by every entry point)
   routes.rs     Thin REST handlers over service
   ws.rs         /ws: forwards broadcast events, heartbeat, RESYNC on lag
@@ -192,17 +196,36 @@ cd backend  && cargo check && cargo test       # must finish with 0 warnings
 cd frontend && npm run typecheck && npm run build
 ```
 
-## Before deploying publicly
+## Deploying (Fly.io)
 
-This is a prototype built for local use. Before putting it on the internet:
+The root `Dockerfile` builds a single image: the frontend is built, and the Rust binary serves it from `STATIC_DIR`. `fly.toml` runs one always-on machine with a volume at `/data` for SQLite.
 
-1. **The web UI and `/api/*` have no authentication.** Anyone with the URL can read and change the board. Add a login or token check, or put the app behind Cloudflare Access or Tailscale.
+```bash
+fly launch --copy-config --no-deploy          # or the Fly web launcher; uses fly.toml (app "shipmd", region ams)
+fly secrets set BOARD_PASSWORD='…' MCP_API_KEY='…'
+fly secrets set TELEGRAM_BOT_TOKEN='…' TELEGRAM_ALLOWED_CHAT_ID='…'   # optional
+fly deploy
+fly scale count 1                              # make sure exactly one machine runs
+```
+
+Open `https://<app>.fly.dev`. The browser asks for the password; any username works. To test the image locally: `docker build -t shipmd . && docker run -p 8080:8080 -v shipmd:/data -e BOARD_PASSWORD=dev shipmd`.
+
+With a password set, scripts authenticate with Basic auth:
+
+```bash
+curl -u ":$BOARD_PASSWORD" https://<app>.fly.dev/api/board
+```
+
+MCP clients keep using `Authorization: Bearer $MCP_API_KEY` on `https://<app>.fly.dev/mcp`.
+
+### Checklist before going public
+
+1. **Set `BOARD_PASSWORD`.** Without it, anyone with the URL can read and change the board.
 2. **Set `MCP_API_KEY`.** If the key is unset, MCP trusts loopback connections. Behind a reverse proxy on the same host (Caddy, nginx), every request looks like loopback, so anyone could connect.
 3. **Set `TELEGRAM_ALLOWED_CHAT_ID`.** Otherwise anyone who finds the bot can change your board.
 4. **Run exactly one instance.** WebSocket events live in the process's memory, and Telegram allows only one bot polling at a time. The SQLite file needs a persistent disk.
-5. **Serve the frontend.** Run `npm run build` and serve `frontend/dist` from a static host, setting `VITE_API_URL`. The backend can't serve it yet.
 
-Good hosts: Fly.io (one machine plus a volume), a small VPS, or Render on a paid plan with a persistent disk. Serverless platforms such as Cloudflare Workers or the free tiers that sleep won't work.
+Other hosts work too: a small VPS (run the image with a volume), or Render on a paid plan with a persistent disk. Serverless platforms such as Cloudflare Workers, and free tiers that sleep, won't work.
 
 ## Known limitations
 

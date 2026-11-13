@@ -21,6 +21,7 @@ cd backend && cargo check            # must print 0 warnings, not just 0 errors
 cd backend && cargo test             # unit tests live in telegram.rs and mcp.rs
 cd frontend && npm run typecheck     # tsc --noEmit
 cd frontend && npm run build         # tsc + vite build
+docker build -t shipmd .             # when you touch Dockerfile, deps or build config
 ```
 
 Run locally with `cd backend && cargo run` (port 3001) and `cd frontend && npm run dev` (port 5173, proxies `/api` and `/ws`). Use `BOARD_DB=/tmp/x.db` for a throwaway database. The database is created and seeded when the file doesn't exist.
@@ -36,7 +37,9 @@ Run locally with `cd backend && cargo run` (port 3001) and `cd frontend && npm r
 | `backend/src/ws.rs` | Forwards broadcast strings to sockets, heartbeat ping, sends `RESYNC` when a client lags. |
 | `backend/src/db.rs` | Pool and WAL options, schema (`CREATE TABLE IF NOT EXISTS`), seed data, `COLUMNS`. |
 | `backend/src/models.rs` | Row types (`Card`, `Column`) and request types (`CreateCard`, `PatchCard`, `AgentAction`, `Tag`, `Assignee`). |
-| `backend/src/main.rs` | `AppState`, `emit()`, `now()`, router wiring, Telegram spawn. |
+| `backend/src/main.rs` | `AppState`, `emit()`, `now()`, router wiring, static frontend (`STATIC_DIR`), Telegram spawn. |
+| `backend/src/auth.rs` | Optional `BOARD_PASSWORD` guard: Basic auth, then an HttpOnly session cookie. Also `constant_time_eq`, which MCP reuses. |
+| `Dockerfile`, `fly.toml` | Single image (frontend build + Rust binary) and Fly.io config: one always-on machine, volume at `/data`. |
 | `frontend/src/store.ts` | Global Solid store, optimistic mutations with rollback, WebSocket client, FLIP animation for remote moves. |
 | `frontend/src/dnd.ts` | Drag and drop state (`createSelector`-based) and drop-position math. |
 | `frontend/src/components/*` | `Header` (ratio bar, theme), `BoardColumn`, `CardItem`, `Composer`, `CardModal`. |
@@ -67,7 +70,7 @@ Run locally with `cd backend && cargo run` (port 3001) and `cd frontend && npm r
     - A tool failure returns a normal result with `isError: true`, so the model can read it and retry. Use JSON-RPC errors only for protocol problems such as an unknown method or tool.
     - Inputs accept column titles or ids case-insensitively, and full or 8-char short card ids.
     - If you add or change a tool, update `tool_definitions()` (strict JSON Schema, `additionalProperties: false`), the `tool_schemas_are_objects` test count, and the README tool table.
-11. **Router wiring:** `mcp::router()` brings its own state and must be `.merge()`d after `.with_state(state)`. CORS goes last. The server must be started with `into_make_service_with_connect_info::<SocketAddr>()`, because the MCP auth guard reads the peer address.
+11. **Router wiring:** board routes (`/api/*`, `/ws`, the static fallback) are one router wrapped in `auth::require`. `/healthz` stays outside it and must remain public for Fly health checks. `mcp::router()` brings its own state and auth, and is `.merge()`d after `.with_state(state)`. CORS goes last. The server must be started with `into_make_service_with_connect_info::<SocketAddr>()`, because the MCP auth guard reads the peer address. A new board route must sit inside the guarded router.
 12. **Single instance.** Don't add anything that assumes more than one backend process: the broadcast channel is in memory, and Telegram's `getUpdates` allows only one poller.
 
 ### Frontend
@@ -91,4 +94,4 @@ If this repo's board is running and connected as an MCP server, work this way: `
 
 ## Known gaps
 
-The README's "Known limitations" and "Before deploying publicly" sections list them. The main ones: no auth on the web UI and REST API, no position rebalancing, and `pick_next_agent_task` doesn't claim cards atomically.
+The README's "Known limitations" and "Checklist before going public" sections list them. The main ones: the web UI and REST API are open unless `BOARD_PASSWORD` is set, there's no position rebalancing, and `pick_next_agent_task` doesn't claim cards atomically.
