@@ -3,11 +3,15 @@
 //! Transports:
 //! - `POST /mcp`: Streamable HTTP (MCP 2025-03-26 / 2025-06-18), stateless, JSON responses.
 //! - `GET /mcp/sse` + `POST /mcp/messages?sessionId=…`: legacy HTTP+SSE (MCP 2024-11-05).
+//! - Token-in-path aliases: `/mcp/t/{token}`, `/mcp/t/{token}/sse`, `/mcp/t/{token}/messages`.
 //!
 //! Tools reuse `crate::service` (SQLite + WebSocket broadcast) and `crate::telegram` notifications,
 //! so an agent's change animates on the web board and pings Telegram like any other change.
 //!
-//! Auth: `SHIPMD_MCP_TOKEN` (or fallback `MCP_API_KEY`) sets the required `Authorization: Bearer <token>`.
+//! Auth: `SHIPMD_MCP_TOKEN` (or fallback `MCP_API_KEY`) sets the required token, accepted via:
+//! - `Authorization: Bearer <token>` header,
+//! - `?token=<token>` URL query parameter, or
+//! - `/mcp/t/<token>` path prefix (for web MCP clients that cannot send custom headers).
 //! When unset, a warning is logged and all requests to `/mcp` are rejected with `401 Unauthorized`.
 
 use std::{
@@ -20,14 +24,14 @@ use std::{
 use axum::{
     body::Bytes,
     extract::{Query, Request, State},
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode, Uri},
     middleware::{self, Next},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
     },
     routing::{get, post},
-    Json, Router,
+    Extension, Json, Router,
 };
 use futures_util::{stream, Stream, StreamExt};
 use serde::Deserialize;
@@ -106,6 +110,16 @@ fn router_with_token(app: AppState, api_key: Option<Arc<str>>) -> Router {
         .route("/mcp", post(streamable_post).get(no_server_stream).delete(no_server_stream))
         .route("/mcp/sse", get(sse_connect))
         .route("/mcp/messages", post(sse_message))
+        .route(
+            "/mcp/t/{token}",
+            post(streamable_post).get(no_server_stream).delete(no_server_stream),
+        )
+        .route(
+            "/mcp/t/{token}/",
+            post(streamable_post).get(no_server_stream).delete(no_server_stream),
+        )
+        .route("/mcp/t/{token}/sse", get(sse_connect))
+        .route("/mcp/t/{token}/messages", post(sse_message))
         .layer(middleware::from_fn_with_state(ctx.clone(), auth))
         .with_state(ctx)
 }
@@ -113,6 +127,18 @@ fn router_with_token(app: AppState, api_key: Option<Arc<str>>) -> Router {
 // ---------------------------------------------------------------------------
 // Auth guard
 // ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+enum AuthSource {
+    Bearer,
+    QueryToken(String),
+    PathToken(String),
+}
+
+#[derive(Deserialize)]
+struct TokenQuery {
+    token: Option<String>,
+}
 
 fn unauthorized(msg: &str) -> Response {
     (
@@ -123,20 +149,99 @@ fn unauthorized(msg: &str) -> Response {
         .into_response()
 }
 
-async fn auth(State(ctx): State<McpCtx>, req: Request, next: Next) -> Response {
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    let raw = headers.get(header::AUTHORIZATION)?.to_str().ok()?.trim();
+    let (scheme, rest) = raw.split_once(' ')?;
+    scheme.eq_ignore_ascii_case("bearer").then(|| rest.trim())
+}
+
+fn raw_query_param(uri: &Uri, name: &str) -> Option<String> {
+    uri.query()?.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=')?;
+        (k == name).then(|| v.to_string())
+    })
+}
+
+fn query_token(uri: &Uri) -> Result<Option<(String, String)>, ()> {
+    let Query(parsed) = Query::<TokenQuery>::try_from_uri(uri).map_err(|_| ())?;
+    Ok(parsed.token.map(|decoded| {
+        let raw = raw_query_param(uri, "token").unwrap_or_else(|| decoded.clone());
+        (raw, decoded)
+    }))
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn percent_decode_path(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hi = bytes.get(i + 1).copied().and_then(hex_val)?;
+            let lo = bytes.get(i + 2).copied().and_then(hex_val)?;
+            out.push((hi << 4) | lo);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn path_token(path: &str) -> Result<Option<(&str, String)>, ()> {
+    let Some(rest) = path.strip_prefix("/mcp/t/") else {
+        return Ok(None);
+    };
+    let raw = rest.split('/').next().unwrap_or("");
+    let decoded = percent_decode_path(raw).ok_or(())?;
+    Ok(Some((raw, decoded)))
+}
+
+async fn auth(State(ctx): State<McpCtx>, mut req: Request, next: Next) -> Response {
     let Some(key) = &ctx.api_key else {
         return unauthorized("SHIPMD_MCP_TOKEN is not configured on the server");
     };
-    let presented = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(str::trim)
-        .unwrap_or_default();
-    if !crate::auth::constant_time_eq(presented.as_bytes(), key.as_bytes()) {
+
+    let bearer = bearer_token(req.headers());
+    let Ok(query) = query_token(req.uri()) else {
+        return unauthorized("missing or invalid MCP bearer token");
+    };
+    let Ok(path) = path_token(req.uri().path()) else {
+        return unauthorized("missing or invalid MCP bearer token");
+    };
+
+    if bearer.is_none() && query.is_none() && path.is_none() {
         return unauthorized("missing or invalid MCP bearer token");
     }
+
+    let matches_key = |candidate: &str| crate::auth::constant_time_eq(candidate.as_bytes(), key.as_bytes());
+    if bearer.is_some_and(|t| !matches_key(t))
+        || query.as_ref().is_some_and(|(_, t)| !matches_key(t))
+        || path.as_ref().is_some_and(|(_, t)| !matches_key(t))
+    {
+        return unauthorized("missing or invalid MCP bearer token");
+    }
+
+    let source = if bearer.is_some() {
+        AuthSource::Bearer
+    } else if let Some((raw, _)) = path {
+        AuthSource::PathToken(raw.to_string())
+    } else if let Some((raw, _)) = query {
+        AuthSource::QueryToken(raw)
+    } else {
+        AuthSource::Bearer
+    };
+    req.extensions_mut().insert(source);
+
     next.run(req).await
 }
 
@@ -171,13 +276,21 @@ impl Drop for SessionGuard {
 }
 
 /// Legacy transport: open the stream, tell the client where to POST.
-async fn sse_connect(State(ctx): State<McpCtx>) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+async fn sse_connect(
+    State(ctx): State<McpCtx>,
+    auth_source: Option<Extension<AuthSource>>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let id = uuid::Uuid::new_v4().to_string();
     let (tx, rx) = mpsc::channel::<String>(64);
     ctx.sessions.lock().unwrap().insert(id.clone(), tx);
     tracing::debug!(session = %id, "MCP SSE session opened");
 
-    let endpoint = Event::default().event("endpoint").data(format!("/mcp/messages?sessionId={id}"));
+    let endpoint_url = match auth_source.map(|Extension(s)| s) {
+        Some(AuthSource::PathToken(raw)) => format!("/mcp/t/{raw}/messages?sessionId={id}"),
+        Some(AuthSource::QueryToken(raw)) => format!("/mcp/messages?sessionId={id}&token={raw}"),
+        _ => format!("/mcp/messages?sessionId={id}"),
+    };
+    let endpoint = Event::default().event("endpoint").data(endpoint_url);
     let guard = SessionGuard { id, sessions: ctx.sessions.clone() };
     let messages = stream::unfold((rx, guard), |(mut rx, guard)| async move {
         let msg = rx.recv().await?;
@@ -812,10 +925,15 @@ mod tests {
         let _ = std::fs::remove_file(format!("{path}-shm"));
     }
 
-    async fn post_mcp(app: &Router, auth_header: Option<&str>, payload: Value) -> (StatusCode, Value) {
+    async fn post_mcp_uri(
+        app: &Router,
+        uri: &str,
+        auth_header: Option<&str>,
+        payload: Value,
+    ) -> (StatusCode, Value) {
         let mut req = axum::http::Request::builder()
             .method("POST")
-            .uri("/mcp")
+            .uri(uri)
             .header(header::CONTENT_TYPE, "application/json");
         if let Some(auth) = auth_header {
             req = req.header(header::AUTHORIZATION, auth);
@@ -833,6 +951,10 @@ mod tests {
             serde_json::from_slice(&bytes).unwrap()
         };
         (status, body)
+    }
+
+    async fn post_mcp(app: &Router, auth_header: Option<&str>, payload: Value) -> (StatusCode, Value) {
+        post_mcp_uri(app, "/mcp", auth_header, payload).await
     }
 
     #[test]
@@ -1087,6 +1209,166 @@ mod tests {
             det_parsed["comments"][0]["comment"],
             "Implemented /mcp and opened PR #42"
         );
+
+        state.pool.close().await;
+        cleanup_db(&db_path);
+    }
+
+    #[tokio::test]
+    async fn auth_accepts_query_and_path_tokens_and_rejects_invalid_with_401() {
+        let (state, db_path) = test_app().await;
+        let tools_req = || json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+
+        // Unconfigured server rejects query & path tokens as 401 as well.
+        let unconfigured = router_with_token(state.clone(), None);
+        let (st, _) = post_mcp_uri(&unconfigured, "/mcp?token=any", None, tools_req()).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+        let (st, _) = post_mcp_uri(&unconfigured, "/mcp/t/any", None, tools_req()).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+
+        let token = "shipmd_mcp_9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c1234";
+        let guarded = router_with_token(state.clone(), Some(Arc::from(token)));
+
+        // Query token: valid -> 200 (also alongside extra query params)
+        let (st, body) = post_mcp_uri(
+            &guarded,
+            &format!("/mcp?token={token}"),
+            None,
+            tools_req(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(body["result"]["tools"].as_array().unwrap().len(), 9);
+
+        let (st, _) = post_mcp_uri(
+            &guarded,
+            &format!("/mcp?client=web&token={token}"),
+            None,
+            tools_req(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+
+        // Query token: wrong, empty, or duplicated -> 401
+        for bad_uri in [
+            "/mcp?token=wrong",
+            "/mcp?token=",
+            &format!("/mcp?token={token}&token=wrong"),
+        ] {
+            let (st, _) = post_mcp_uri(&guarded, bad_uri, None, tools_req()).await;
+            assert_eq!(st, StatusCode::UNAUTHORIZED, "expected 401 for {bad_uri}");
+        }
+
+        // Path prefix /mcp/t/<token> (and trailing slash): valid -> 200; wrong -> 401
+        let (st, body) = post_mcp_uri(
+            &guarded,
+            &format!("/mcp/t/{token}"),
+            None,
+            tools_req(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(body["result"]["tools"].as_array().unwrap().len(), 9);
+
+        let (st, _) = post_mcp_uri(
+            &guarded,
+            &format!("/mcp/t/{token}/"),
+            None,
+            tools_req(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+
+        let (st, _) = post_mcp_uri(&guarded, "/mcp/t/wrong-token", None, tools_req()).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+
+        let (st, _) = post_mcp_uri(&guarded, "/mcp/t/bad%ZZ", None, tools_req()).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+
+        // Mismatched dual credentials (e.g. valid Bearer + wrong query/path) -> 401
+        let auth_ok = Some("Bearer shipmd_mcp_9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c1234");
+        let (st, _) = post_mcp_uri(&guarded, "/mcp?token=wrong", auth_ok, tools_req()).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+        let (st, _) = post_mcp_uri(&guarded, "/mcp/t/wrong", auth_ok, tools_req()).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+
+        // Percent-encoded special chars in path and query
+        let special = router_with_token(state.clone(), Some(Arc::from("tok+123/abc")));
+        let (st, _) = post_mcp_uri(&special, "/mcp/t/tok%2B123%2Fabc", None, tools_req()).await;
+        assert_eq!(st, StatusCode::OK);
+        let (st, _) = post_mcp_uri(&special, "/mcp?token=tok%2B123%2Fabc", None, tools_req()).await;
+        assert_eq!(st, StatusCode::OK);
+
+        state.pool.close().await;
+        cleanup_db(&db_path);
+    }
+
+    async fn open_sse_endpoint(
+        app: &Router,
+        uri: &str,
+        auth_header: Option<&str>,
+    ) -> (StatusCode, Option<String>, Option<axum::body::BodyDataStream>) {
+        let mut req = axum::http::Request::builder().method("GET").uri(uri);
+        if let Some(auth) = auth_header {
+            req = req.header(header::AUTHORIZATION, auth);
+        }
+        let resp = app.clone().oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+        let status = resp.status();
+        if status != StatusCode::OK {
+            return (status, None, None);
+        }
+        let mut data_stream = resp.into_body().into_data_stream();
+        let first = data_stream.next().await.unwrap().unwrap();
+        let text = String::from_utf8(first.to_vec()).unwrap();
+        let endpoint = text
+            .lines()
+            .find_map(|line| line.strip_prefix("data:"))
+            .map(str::trim)
+            .map(ToString::to_string);
+        (status, endpoint, Some(data_stream))
+    }
+
+    #[tokio::test]
+    async fn sse_preserves_query_and_path_token_for_messages() {
+        let (state, db_path) = test_app().await;
+        let token = "sse-tok-123";
+        let app = router_with_token(state.clone(), Some(Arc::from(token)));
+        let list_req = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"});
+
+        // Unauthorized SSE attempts -> 401
+        let (st, _, _) = open_sse_endpoint(&app, "/mcp/sse", None).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+        let (st, _, _) = open_sse_endpoint(&app, "/mcp/sse?token=wrong", None).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+        let (st, _, _) = open_sse_endpoint(&app, "/mcp/t/wrong/sse", None).await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+
+        // 1. Bearer SSE -> clean /mcp/messages?sessionId=...
+        let (st, endpoint, _stream1) =
+            open_sse_endpoint(&app, "/mcp/sse", Some("Bearer sse-tok-123")).await;
+        assert_eq!(st, StatusCode::OK);
+        let ep1 = endpoint.unwrap();
+        assert!(ep1.starts_with("/mcp/messages?sessionId="), "got {ep1}");
+        assert!(!ep1.contains("token="));
+
+        // 2. Query-token SSE -> endpoint keeps &token=..., POST without headers succeeds (202)
+        let (st, endpoint, _stream2) =
+            open_sse_endpoint(&app, "/mcp/sse?token=sse-tok-123", None).await;
+        assert_eq!(st, StatusCode::OK);
+        let ep2 = endpoint.unwrap();
+        assert!(ep2.starts_with("/mcp/messages?sessionId="), "got {ep2}");
+        assert!(ep2.ends_with("&token=sse-tok-123"), "got {ep2}");
+        let (post_st, _) = post_mcp_uri(&app, &ep2, None, list_req.clone()).await;
+        assert_eq!(post_st, StatusCode::ACCEPTED);
+
+        // 3. Path-prefix SSE -> endpoint uses /mcp/t/<token>/messages?sessionId=..., POST without headers succeeds (202)
+        let (st, endpoint, _stream3) =
+            open_sse_endpoint(&app, "/mcp/t/sse-tok-123/sse", None).await;
+        assert_eq!(st, StatusCode::OK);
+        let ep3 = endpoint.unwrap();
+        assert!(ep3.starts_with("/mcp/t/sse-tok-123/messages?sessionId="), "got {ep3}");
+        let (post_st, _) = post_mcp_uri(&app, &ep3, None, list_req).await;
+        assert_eq!(post_st, StatusCode::ACCEPTED);
 
         state.pool.close().await;
         cleanup_db(&db_path);
