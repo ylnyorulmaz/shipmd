@@ -1,6 +1,6 @@
 import { batch, createSelector, createSignal } from 'solid-js';
 import { flip, prefersReducedMotion } from './flip';
-import { board, GAP, moveCard, sortedCardsIn } from './store';
+import { board, GAP, moveCard, sortedCardsIn, visibleCardsIn } from './store';
 
 /**
  * Pointer-based drag and drop (mouse / pen).
@@ -138,7 +138,7 @@ function begin(p: Pending, e: PointerEvent) {
   });
   document.body.appendChild(ghost);
 
-  const siblings = sortedCardsIn(card.column_id);
+  const siblings = visibleCardsIn(card.column_id);
   const next = siblings[siblings.findIndex((c) => c.id === p.id) + 1];
   const originKey = dropKeyFor(card.column_id, next?.id ?? null);
 

@@ -2,7 +2,8 @@ import { createSignal } from 'solid-js';
 import { createStore, produce, reconcile } from 'solid-js/store';
 import { api, CLIENT_ID, uuid, wsUrl } from './api';
 import { flip, prefersReducedMotion } from './flip';
-import type { Assignee, Card, CardPatch, Column, Tag, WsEvent } from './types';
+import { ASSIGNEE_PRESETS, type Assignee, type Card, type CardPatch, type Column, type Tag, type WsEvent } from './types';
+import { normalizeAssignee } from './ui';
 
 export const GAP = 1024;
 
@@ -28,6 +29,8 @@ export const [connected, setConnected] = createSignal(false);
 export const [openCardId, setOpenCardId] = createSignal<string | null>(null);
 /** Column whose inline "add card" composer is open. */
 export const [composerColumn, setComposerColumn] = createSignal<string | null>(null);
+/** Active assignee filter (`null` shows all cards). */
+export const [assigneeFilter, setAssigneeFilter] = createSignal<string | null>(null);
 
 export const [toast, setToast] = createSignal<string | null>(null);
 let toastTimer: number | undefined;
@@ -45,6 +48,13 @@ export function sortedCardsIn(columnId: string): Card[] {
   const out: Card[] = [];
   for (const c of Object.values(board.cards)) if (c.column_id === columnId) out.push(c);
   return out.sort((a, b) => a.position - b.position);
+}
+
+export function visibleCardsIn(columnId: string): Card[] {
+  const filter = assigneeFilter();
+  const cards = sortedCardsIn(columnId);
+  if (!filter) return cards;
+  return cards.filter((c) => normalizeAssignee(c.assignee) === filter);
 }
 
 export const doneColumnId = () => board.columns[board.columns.length - 1]?.id;
@@ -90,13 +100,21 @@ export async function moveCard(id: string, column_id: string, position: number) 
 export async function updateCard(id: string, patch: CardPatch) {
   const card = board.cards[id];
   if (!card) return;
+  const normalizedPatch: CardPatch = { ...patch };
+  if (normalizedPatch.assignee !== undefined) {
+    const cleaned = normalizeAssignee(normalizedPatch.assignee);
+    if (!cleaned) return;
+    normalizedPatch.assignee = cleaned;
+  }
   const prev: Partial<Card> = {};
-  for (const k of Object.keys(patch) as (keyof CardPatch)[]) (prev as any)[k] = card[k];
-  const local: Partial<Card> = { ...patch } as Partial<Card>;
-  if (patch.description !== undefined) local.description = patch.description.trim() ? patch.description : null;
+  for (const k of Object.keys(normalizedPatch) as (keyof CardPatch)[]) (prev as any)[k] = card[k];
+  const local: Partial<Card> = { ...normalizedPatch } as Partial<Card>;
+  if (normalizedPatch.description !== undefined) {
+    local.description = normalizedPatch.description.trim() ? normalizedPatch.description : null;
+  }
   setBoard('cards', id, local);
   try {
-    const saved = await api.patch(id, patch);
+    const saved = await api.patch(id, normalizedPatch);
     setBoard('cards', id, 'updated_at', saved.updated_at);
   } catch (e) {
     if (board.cards[id]) setBoard('cards', id, prev);
@@ -107,19 +125,22 @@ export async function updateCard(id: string, patch: CardPatch) {
 export function toggleAssignee(id: string) {
   const card = board.cards[id];
   if (!card) return;
-  const next: Assignee = card.assignee === 'agent' ? 'human' : 'agent';
+  const current = normalizeAssignee(card.assignee);
+  const idx = ASSIGNEE_PRESETS.indexOf(current as (typeof ASSIGNEE_PRESETS)[number]);
+  const next: Assignee = ASSIGNEE_PRESETS[(idx + 1) % ASSIGNEE_PRESETS.length];
   return updateCard(id, { assignee: next });
 }
 
 export async function createCard(input: { column_id: string; title: string; tag: Tag; assignee: Assignee }) {
   const last = sortedCardsIn(input.column_id).at(-1);
+  const assignee = normalizeAssignee(input.assignee) || 'human';
   const card: Card = {
     id: uuid(),
     column_id: input.column_id,
     title: input.title,
     description: null,
     tag: input.tag,
-    assignee: input.assignee,
+    assignee,
     position: last ? last.position + GAP : GAP,
     updated_at: new Date().toISOString(),
   };
