@@ -459,6 +459,8 @@ async fn quick_add(bot: &Telegram, state: &AppState, chat_id: i64, text: &str) -
             status: None,
             priority: None,
             pr_url: None,
+            repo: None,
+            labels: None,
             position: None,
         },
         Some(ORIGIN.into()),

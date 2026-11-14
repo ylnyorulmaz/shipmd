@@ -70,7 +70,7 @@ mod tests {
     use axum::{
         body::Body,
         http::{header, Request, StatusCode},
-        routing::{patch, post},
+        routing::{get, patch, post},
         Router,
     };
     use serde_json::{json, Value};
@@ -91,6 +91,7 @@ mod tests {
             telegram: None,
         };
         let app = Router::new()
+            .route("/api/board", get(get_board))
             .route("/api/cards", post(create_card))
             .route("/api/cards/{id}", patch(update_card))
             .with_state(state.clone());
@@ -200,6 +201,89 @@ mod tests {
         )
         .await;
         assert_eq!(st_long, StatusCode::BAD_REQUEST);
+
+        state.pool.close().await;
+        cleanup_db(&db_path);
+    }
+
+    #[tokio::test]
+    async fn create_patch_and_board_handle_repo_labels_and_priority_order() {
+        let (app, state, db_path) = test_router().await;
+
+        let (st1, low) = send_json(
+            &app,
+            "POST",
+            "/api/cards",
+            json!({
+                "column_id": "backlog",
+                "title": "Low card",
+                "assignee": "kimi",
+                "repo": "Shipmd",
+                "labels": ["#Frontend", "bug", "frontend"],
+                "priority": 0
+            }),
+        )
+        .await;
+        assert_eq!(st1, StatusCode::CREATED);
+        assert_eq!(low["assignee"], "kimi");
+        assert_eq!(low["repo"], "shipmd");
+        assert_eq!(low["labels"], json!(["frontend", "bug"]));
+        assert_eq!(low["priority"], 0);
+
+        let (st2, urgent) = send_json(
+            &app,
+            "POST",
+            "/api/cards",
+            json!({
+                "column_id": "backlog",
+                "title": "Urgent card",
+                "repo": "ceviz-ai",
+                "labels": "#api, urgent",
+                "priority": 10
+            }),
+        )
+        .await;
+        assert_eq!(st2, StatusCode::CREATED);
+        assert_eq!(urgent["repo"], "ceviz-ai");
+        assert_eq!(urgent["labels"], json!(["api", "urgent"]));
+        assert_eq!(urgent["priority"], 10);
+
+        // GET /api/board orders higher priority cards first within each column.
+        let board_resp = app
+            .clone()
+            .oneshot(Request::builder().method("GET").uri("/api/board").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(board_resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(board_resp.into_body(), 1024 * 1024).await.unwrap();
+        let board_json: Value = serde_json::from_slice(&bytes).unwrap();
+        let backlog_cards = board_json["columns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["id"] == "backlog")
+            .unwrap()["cards"]
+            .as_array()
+            .unwrap();
+        assert_eq!(backlog_cards[0]["id"], urgent["id"]);
+
+        // PATCH updates and clears repo & labels.
+        let id = low["id"].as_str().unwrap();
+        let (pst, patched) = send_json(
+            &app,
+            "PATCH",
+            &format!("/api/cards/{id}"),
+            json!({
+                "repo": "",
+                "labels": [],
+                "priority": 8
+            }),
+        )
+        .await;
+        assert_eq!(pst, StatusCode::OK);
+        assert_eq!(patched["repo"], Value::Null);
+        assert_eq!(patched["labels"], json!([]));
+        assert_eq!(patched["priority"], 8);
 
         state.pool.close().await;
         cleanup_db(&db_path);

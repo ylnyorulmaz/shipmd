@@ -429,14 +429,17 @@ fn tool_definitions() -> Value {
         {
             "name": "list_tasks",
             "title": "List tasks",
-            "description": "List tasks filtered by optional assignee (e.g. \"antigravity\", \"hermes\", \"human\", \"agent\") \
-and/or status (todo, in_progress, review, done, or column names backlog, build, sell). \
+            "description": "List tasks filtered by optional assignee (e.g. \"antigravity\", \"kimi\", \"hermes\", \"human\", \"agent\"), \
+status (todo, in_progress, review, done, or column names backlog, build, sell), repo (e.g. \"shipmd\"), and/or label(s). \
 Matching tasks are returned sorted by priority descending (highest priority first), then board position.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "assignee": { "type": "string", "description": "Filter by assignee (e.g. \"antigravity\", \"hermes\", \"human\", \"agent\"). Case-insensitive." },
+                    "assignee": { "type": "string", "description": "Filter by assignee (e.g. \"antigravity\", \"kimi\", \"hermes\", \"human\", \"agent\"). Case-insensitive." },
                     "status": { "type": "string", "enum": status_enum, "description": "Filter by status (todo, in_progress, review, done, backlog, build, sell)." },
+                    "repo": { "type": "string", "description": "Filter by repository/project name (e.g. \"shipmd\", \"ceviz-ai\"). Case-insensitive." },
+                    "label": { "type": "string", "description": "Filter by a single label (with or without leading #, e.g. \"frontend\")." },
+                    "labels": { "type": "array", "items": { "type": "string" }, "description": "Filter to tasks containing all specified labels." },
                     "limit": { "type": "integer", "minimum": 1, "maximum": MAX_LIST_LIMIT, "default": DEFAULT_LIST_LIMIT, "description": "Maximum number of tasks to return." }
                 },
                 "additionalProperties": false
@@ -446,7 +449,7 @@ Matching tasks are returned sorted by priority descending (highest priority firs
         {
             "name": "get_task_details",
             "title": "Get task details",
-            "description": "Fetch full details for a task by task_id: full Markdown description, parsed checklist substeps, comments, current status, assignee, priority, and pr_url.",
+            "description": "Fetch full details for a task by task_id: full Markdown description, parsed checklist substeps, comments, current status, assignee, repo, labels, priority, and pr_url.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -460,14 +463,17 @@ Matching tasks are returned sorted by priority descending (highest priority firs
         {
             "name": "update_task_status",
             "title": "Update task status",
-            "description": "Update a task's status (e.g. todo, in_progress, review, done) and optionally reassign it or attach a PR URL. \
+            "description": "Update a task's status (e.g. todo, in_progress, review, done) and optionally reassign it, update repo, labels, priority, or attach a PR URL. \
 Moves the card to the matching board column and broadcasts the change live; moving to done also notifies Telegram.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "task_id": task_id,
                     "status": { "type": "string", "enum": status_enum, "description": "Target status (e.g. todo, in_progress, review, done)." },
-                    "assignee": { "type": "string", "minLength": 1, "maxLength": 64, "description": "Optional new assignee (e.g. \"antigravity\", \"hermes\", \"human\", \"agent\")." },
+                    "assignee": { "type": "string", "minLength": 1, "maxLength": 64, "description": "Optional new assignee (e.g. \"antigravity\", \"kimi\", \"hermes\", \"human\", \"agent\")." },
+                    "repo": { "type": "string", "maxLength": 64, "description": "Optional repository/project name (empty string clears)." },
+                    "labels": { "type": "array", "items": { "type": "string" }, "description": "Optional list of labels (replaces existing labels; empty array clears)." },
+                    "priority": { "type": "integer", "description": "Optional integer priority (e.g. 0=Low, 5=Normal, 8=High, 10=Urgent)." },
                     "pr_url": { "type": "string", "maxLength": 2048, "description": "Optional pull request URL associated with the task." }
                 },
                 "required": ["task_id", "status"],
@@ -518,8 +524,10 @@ Cards are in board position order (top first). Without a filter, Done is limited
                     "description": { "type": "string", "description": "Optional Markdown details (acceptance criteria, links, checklists)." },
                     "column": { "type": "string", "enum": column_enum, "default": "Backlog", "description": "Column to create the card in." },
                     "tag": { "type": "string", "enum": ["build", "sell", "ops"], "default": "build", "description": "build = product/engineering, sell = marketing/sales, ops = operations." },
-                    "assignee": { "type": "string", "minLength": 1, "maxLength": 64, "default": "agent", "description": "Who should do it (e.g. \"agent\", \"antigravity\", \"hermes\", \"human\")." },
-                    "priority": { "type": "integer", "default": 0, "description": "Optional integer priority (higher values sort first in list_tasks)." }
+                    "assignee": { "type": "string", "minLength": 1, "maxLength": 64, "default": "agent", "description": "Who should do it (e.g. \"agent\", \"antigravity\", \"kimi\", \"hermes\", \"human\")." },
+                    "repo": { "type": "string", "maxLength": 64, "description": "Optional repository/project name (e.g. \"shipmd\", \"ceviz-ai\", \"antisocial\", \"kahvefalim\")." },
+                    "labels": { "type": "array", "items": { "type": "string" }, "description": "Optional list of labels (e.g. [\"frontend\", \"bug\"])." },
+                    "priority": { "type": "integer", "default": 0, "description": "Optional integer priority (higher values sort first)." }
                 },
                 "required": ["title"],
                 "additionalProperties": false
@@ -660,10 +668,28 @@ fn card_json(card: &Card) -> Value {
         "assignee": card.assignee,
         "priority": card.priority,
         "pr_url": card.pr_url,
+        "repo": card.repo,
+        "labels": card.labels,
         "description": card.description,
         "position": card.position,
         "updated_at": card.updated_at,
     })
+}
+
+fn labels_arg(args: &Value, key: &str) -> Result<Option<Vec<String>>, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(arr)) => {
+            let mut out = Vec::with_capacity(arr.len());
+            for item in arr {
+                let s = item.as_str().ok_or_else(|| format!("{key} entries must be strings"))?;
+                out.push(s.to_string());
+            }
+            Ok(Some(out))
+        }
+        Some(Value::String(s)) => Ok(Some(s.split(',').map(ToString::to_string).collect())),
+        _ => Err(format!("{key} must be an array of strings")),
+    }
 }
 
 fn parse_substeps(description: Option<&str>) -> Vec<Value> {
@@ -699,6 +725,13 @@ fn notify(app: &AppState, text: String, card: &Card) {
 async fn list_tasks(app: &AppState, args: &Value) -> ToolResult {
     let assignee = str_arg(args, "assignee");
     let status = str_arg(args, "status");
+    let repo = str_arg(args, "repo");
+    let mut filter_labels = labels_arg(args, "labels")?.unwrap_or_default();
+    if let Some(single) = str_arg(args, "label") {
+        filter_labels.push(single.to_string());
+    }
+    let labels_opt = (!filter_labels.is_empty()).then_some(filter_labels.as_slice());
+
     let limit = match args.get("limit") {
         None | Some(Value::Null) => DEFAULT_LIST_LIMIT,
         Some(v) => {
@@ -710,7 +743,7 @@ async fn list_tasks(app: &AppState, args: &Value) -> ToolResult {
         }
     };
 
-    let tasks = service::list_tasks(app, assignee, status, limit)
+    let tasks = service::list_tasks(app, assignee, status, repo, labels_opt, limit)
         .await
         .map_err(app_err)?;
     Ok(json!({
@@ -736,12 +769,21 @@ async fn update_task_status(app: &AppState, args: &Value) -> ToolResult {
     let status = str_arg(args, "status").ok_or("status is required")?;
     let assignee = str_arg(args, "assignee").map(str::to_string);
     let pr_url = args.get("pr_url").and_then(Value::as_str).map(str::to_string);
+    let repo = args.get("repo").and_then(Value::as_str).map(str::to_string);
+    let labels = labels_arg(args, "labels")?;
+    let priority = match args.get("priority") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(v.as_i64().ok_or("priority must be an integer")?),
+    };
 
     let before = service::resolve_card(app, &key).await.map_err(app_err)?;
     let patch = PatchCard {
         status: Some(status.to_string()),
         assignee,
         pr_url,
+        repo,
+        labels,
+        priority,
         ..Default::default()
     };
     let card = service::update_card(app, &before.id, patch, Some(ORIGIN.into()))
@@ -807,6 +849,8 @@ async fn create_card(app: &AppState, args: &Value) -> ToolResult {
         Some(other) => return Err(format!("invalid tag '{other}' — use build, sell or ops")),
     };
     let assignee = str_arg(args, "assignee").unwrap_or("agent").to_string();
+    let repo = str_arg(args, "repo").map(str::to_string);
+    let labels = labels_arg(args, "labels")?;
     let priority = match args.get("priority") {
         None | Some(Value::Null) => None,
         Some(v) => Some(v.as_i64().ok_or("priority must be an integer")?),
@@ -823,6 +867,8 @@ async fn create_card(app: &AppState, args: &Value) -> ToolResult {
             status: None,
             priority,
             pr_url: None,
+            repo,
+            labels,
             position: None,
         },
         Some(ORIGIN.into()),
@@ -1065,6 +1111,8 @@ mod tests {
                 status: None,
                 priority: Some(1),
                 pr_url: None,
+                repo: Some("ceviz-ai".into()),
+                labels: Some(vec!["backend".into()]),
                 position: None,
             },
             None,
@@ -1084,6 +1132,8 @@ mod tests {
                 status: None,
                 priority: Some(10),
                 pr_url: None,
+                repo: Some("shipmd".into()),
+                labels: Some(vec!["#frontend".into(), "bug".into()]),
                 position: None,
             },
             None,
@@ -1205,10 +1255,80 @@ mod tests {
         assert_eq!(det_parsed["substeps"].as_array().unwrap().len(), 2);
         assert_eq!(det_parsed["comments"].as_array().unwrap().len(), 1);
         assert_eq!(det_parsed["comments"][0]["author"], "hermes");
-        assert_eq!(
-            det_parsed["comments"][0]["comment"],
-            "Implemented /mcp and opened PR #42"
-        );
+        assert_eq!(det_parsed["comments"][0]["comment"], "Implemented /mcp and opened PR #42");
+        assert_eq!(det_parsed["task"]["repo"], "shipmd");
+        assert_eq!(det_parsed["task"]["labels"], json!(["frontend", "bug"]));
+
+        // MCP create_card with repo and labels, list_tasks filtering by repo & label, update_task_status updating repo & labels
+        let (_, create_res) = post_mcp(
+            &app,
+            auth,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "tools/call",
+                "params": {
+                    "name": "create_card",
+                    "arguments": {
+                        "title": "Kimi modal task",
+                        "assignee": "kimi",
+                        "repo": "antisocial",
+                        "labels": ["#ui", "priority"],
+                        "priority": 8
+                    }
+                }
+            }),
+        )
+        .await;
+        let created_parsed: Value =
+            serde_json::from_str(create_res["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        let created_id = created_parsed["created"]["id"].as_str().unwrap().to_string();
+        assert_eq!(created_parsed["created"]["repo"], "antisocial");
+        assert_eq!(created_parsed["created"]["labels"], json!(["ui", "priority"]));
+        assert_eq!(created_parsed["created"]["assignee"], "kimi");
+
+        let (_, filter_repo_res) = post_mcp(
+            &app,
+            auth,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 8,
+                "method": "tools/call",
+                "params": {
+                    "name": "list_tasks",
+                    "arguments": { "repo": "antisocial", "label": "#ui" }
+                }
+            }),
+        )
+        .await;
+        let filter_parsed: Value =
+            serde_json::from_str(filter_repo_res["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(filter_parsed["count"], 1);
+        assert_eq!(filter_parsed["tasks"][0]["id"], created_id);
+
+        let (_, upd_labels_res) = post_mcp(
+            &app,
+            auth,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "tools/call",
+                "params": {
+                    "name": "update_task_status",
+                    "arguments": {
+                        "task_id": created_id,
+                        "status": "in_progress",
+                        "repo": "kahvefalim",
+                        "labels": ["ux"]
+                    }
+                }
+            }),
+        )
+        .await;
+        let upd_labels_parsed: Value =
+            serde_json::from_str(upd_labels_res["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(upd_labels_parsed["task"]["repo"], "kahvefalim");
+        assert_eq!(upd_labels_parsed["task"]["labels"], json!(["ux"]));
 
         state.pool.close().await;
         cleanup_db(&db_path);

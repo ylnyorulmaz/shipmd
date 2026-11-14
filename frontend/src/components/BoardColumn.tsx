@@ -1,6 +1,6 @@
 import { createMemo, For, Show } from 'solid-js';
 import { dropKeyFor, ghostHeight, isDropTarget } from '../dnd';
-import { assigneeFilter, composerColumn, setComposerColumn, sortedCardsIn, visibleCardsIn } from '../store';
+import { composerColumn, hasActiveFilters, setComposerColumn, sortedCardsIn, visibleCardsIn } from '../store';
 import type { Column } from '../types';
 import CardItem from './CardItem';
 import Composer from './Composer';
@@ -28,7 +28,7 @@ export default function BoardColumn(props: { column: Column }) {
       <header class="flex items-center justify-between px-3 pt-2.5 pb-1.5">
         <h2 class="text-[14px] font-semibold text-slate-800 dark:text-zinc-100">{props.column.title}</h2>
         <span class="rounded-full px-1.5 text-xs font-medium text-slate-500 tabular-nums dark:text-zinc-500">
-          {assigneeFilter() ? `${cards().length}/${allCards().length}` : cards().length}
+          {hasActiveFilters() ? `${cards().length}/${allCards().length}` : cards().length}
         </span>
       </header>
 

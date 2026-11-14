@@ -13,7 +13,7 @@ use crate::{
 
 const GAP: f64 = 1024.0;
 const CARD_COLS: &str =
-    "id, column_id, title, description, tag, assignee, status, priority, pr_url, position, updated_at";
+    "id, column_id, title, description, tag, assignee, status, priority, pr_url, repo, labels, position, updated_at";
 
 /// Column the Build/Sell ratio counts as "shipped".
 pub const DONE_COLUMN: &str = "done";
@@ -62,6 +62,39 @@ fn clean_pr_url(raw: Option<String>) -> AppResult<Option<String>> {
             Ok(Some(trimmed.to_string()))
         }
     }
+}
+
+fn clean_repo(raw: Option<String>) -> AppResult<Option<String>> {
+    match raw {
+        None => Ok(None),
+        Some(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return Ok(None);
+            }
+            if trimmed.chars().count() > 64 || trimmed.chars().any(char::is_control) {
+                return Err(AppError::BadRequest("repo must be at most 64 printable chars".into()));
+            }
+            Ok(Some(trimmed.to_ascii_lowercase()))
+        }
+    }
+}
+
+fn clean_labels(raw: Vec<String>) -> AppResult<Vec<String>> {
+    let labels = normalize_label_list(raw);
+    if labels.len() > 20 {
+        return Err(AppError::BadRequest("at most 20 labels are allowed per card".into()));
+    }
+    for label in &labels {
+        if label.chars().count() > 40 || label.chars().any(char::is_control) {
+            return Err(AppError::BadRequest("each label must be at most 40 printable chars".into()));
+        }
+    }
+    Ok(labels)
+}
+
+fn labels_json(labels: &[String]) -> String {
+    serde_json::to_string(labels).unwrap_or_else(|_| "[]".into())
 }
 
 pub fn status_for_column(col: &str) -> &'static str {
@@ -146,7 +179,7 @@ async fn top_position(state: &AppState, column_id: &str) -> AppResult<f64> {
 async fn save_card(state: &AppState, c: &Card) -> AppResult<()> {
     sqlx::query(
         "UPDATE cards SET column_id = ?, title = ?, description = ?, tag = ?, assignee = ?,
-                          status = ?, priority = ?, pr_url = ?, position = ?, updated_at = ?
+                          status = ?, priority = ?, pr_url = ?, repo = ?, labels = ?, position = ?, updated_at = ?
          WHERE id = ?",
     )
     .bind(&c.column_id)
@@ -157,6 +190,8 @@ async fn save_card(state: &AppState, c: &Card) -> AppResult<()> {
     .bind(&c.status)
     .bind(c.priority)
     .bind(&c.pr_url)
+    .bind(&c.repo)
+    .bind(labels_json(&c.labels))
     .bind(c.position)
     .bind(&c.updated_at)
     .bind(&c.id)
@@ -174,7 +209,7 @@ pub async fn board(state: &AppState) -> AppResult<Board> {
         .fetch_all(&state.pool)
         .await?;
     let cards = sqlx::query_as::<_, Card>(&format!(
-        "SELECT {CARD_COLS} FROM cards ORDER BY position, updated_at"
+        "SELECT {CARD_COLS} FROM cards ORDER BY priority DESC, position ASC, updated_at ASC"
     ))
     .fetch_all(&state.pool)
     .await?;
@@ -249,6 +284,8 @@ pub async fn create_card(state: &AppState, input: CreateCard, origin: Option<Str
         None => status_for_column(&input.column_id).into(),
     };
     let pr_url = clean_pr_url(input.pr_url)?;
+    let repo = clean_repo(input.repo)?;
+    let labels = clean_labels(input.labels.unwrap_or_default())?;
 
     let card = Card {
         id: input.id.unwrap_or_else(uuid::Uuid::new_v4).to_string(),
@@ -260,13 +297,15 @@ pub async fn create_card(state: &AppState, input: CreateCard, origin: Option<Str
         status,
         priority: input.priority.unwrap_or(0),
         pr_url,
+        repo,
+        labels,
         position,
         updated_at: now(),
     };
 
     let res = sqlx::query(
-        "INSERT INTO cards (id, column_id, title, description, tag, assignee, status, priority, pr_url, position, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO cards (id, column_id, title, description, tag, assignee, status, priority, pr_url, repo, labels, position, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&card.id)
     .bind(&card.column_id)
@@ -277,6 +316,8 @@ pub async fn create_card(state: &AppState, input: CreateCard, origin: Option<Str
     .bind(&card.status)
     .bind(card.priority)
     .bind(&card.pr_url)
+    .bind(&card.repo)
+    .bind(labels_json(&card.labels))
     .bind(card.position)
     .bind(&card.updated_at)
     .execute(&state.pool)
@@ -358,6 +399,12 @@ pub async fn update_card(state: &AppState, id: &str, patch: PatchCard, origin: O
     }
     if let Some(pr_url) = patch.pr_url {
         card.pr_url = clean_pr_url(Some(pr_url))?;
+    }
+    if let Some(repo) = patch.repo {
+        card.repo = clean_repo(Some(repo))?;
+    }
+    if let Some(labels) = patch.labels {
+        card.labels = clean_labels(labels)?;
     }
 
     card.updated_at = now();
@@ -451,16 +498,29 @@ pub async fn list_tasks(
     state: &AppState,
     assignee: Option<&str>,
     status: Option<&str>,
+    repo: Option<&str>,
+    labels: Option<&[String]>,
     limit: usize,
 ) -> AppResult<Vec<Card>> {
     let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(format!("SELECT {CARD_COLS} FROM cards"));
     let mut has_where = false;
+    let mut push_cond = |qb: &mut sqlx::QueryBuilder<'_, sqlx::Sqlite>| {
+        qb.push(if has_where { " AND " } else { " WHERE " });
+        has_where = true;
+    };
 
     if let Some(a) = assignee.map(str::trim).filter(|s| !s.is_empty()) {
-        qb.push(" WHERE LOWER(assignee) = LOWER(");
+        push_cond(&mut qb);
+        qb.push("LOWER(assignee) = LOWER(");
         qb.push_bind(a);
         qb.push(")");
-        has_where = true;
+    }
+
+    if let Some(r) = repo.map(str::trim).filter(|s| !s.is_empty()) {
+        push_cond(&mut qb);
+        qb.push("LOWER(COALESCE(repo, '')) = LOWER(");
+        qb.push_bind(r);
+        qb.push(")");
     }
 
     if let Some(raw_status) = status.map(str::trim).filter(|s| !s.is_empty()) {
@@ -477,7 +537,7 @@ pub async fn list_tasks(
                 )));
             }
         };
-        qb.push(if has_where { " AND " } else { " WHERE " });
+        push_cond(&mut qb);
         if let Some(col) = col_filter {
             qb.push("column_id = ");
             qb.push_bind(col.to_string());
@@ -487,10 +547,21 @@ pub async fn list_tasks(
         }
     }
 
-    qb.push(" ORDER BY priority DESC, position ASC, updated_at ASC LIMIT ");
-    qb.push_bind(limit as i64);
+    let wanted_labels = labels
+        .map(|l| normalize_label_list(l.iter().map(String::as_str)))
+        .unwrap_or_default();
 
-    let cards = qb.build_query_as::<Card>().fetch_all(&state.pool).await?;
+    qb.push(" ORDER BY priority DESC, position ASC, updated_at ASC");
+    if wanted_labels.is_empty() {
+        qb.push(" LIMIT ");
+        qb.push_bind(limit as i64);
+    }
+
+    let mut cards = qb.build_query_as::<Card>().fetch_all(&state.pool).await?;
+    if !wanted_labels.is_empty() {
+        cards.retain(|c| wanted_labels.iter().all(|w| c.labels.contains(w)));
+        cards.truncate(limit);
+    }
     Ok(cards)
 }
 

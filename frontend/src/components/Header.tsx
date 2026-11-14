@@ -1,5 +1,5 @@
 import { createMemo, createSignal, Show } from 'solid-js';
-import { board, connected, doneColumnId, setComposerColumn } from '../store';
+import { board, connected, doneColumnId, setCreateModalOpen } from '../store';
 
 function RatioBar() {
   const stats = createMemo(() => {
@@ -117,7 +117,7 @@ export default function Header() {
         <ThemeToggle />
         <button
           type="button"
-          onClick={() => setComposerColumn(board.columns[0]?.id ?? null)}
+          onClick={() => setCreateModalOpen(true)}
           title="Add card (N)"
           class="flex h-8 items-center gap-1.5 rounded-md bg-sky-600 px-3 text-sm font-medium text-white shadow-sm hover:bg-sky-700 active:bg-sky-800"
         >
