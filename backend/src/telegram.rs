@@ -455,7 +455,10 @@ async fn quick_add(bot: &Telegram, state: &AppState, chat_id: i64, text: &str) -
             title: q.title,
             description: q.description,
             tag: Some(q.tag),
-            assignee: Some(q.assignee),
+            assignee: Some(q.assignee.as_str().into()),
+            status: None,
+            priority: None,
+            pr_url: None,
             position: None,
         },
         Some(ORIGIN.into()),
@@ -499,8 +502,8 @@ async fn handle_callback(
         }
         "toggle_assignee" => match service::fetch_card(state, arg).await {
             Ok(card) => {
-                let next = if card.assignee == "agent" { Assignee::Human } else { Assignee::Agent };
-                let patch = PatchCard { assignee: Some(next), ..Default::default() };
+                let next = if card.assignee != "human" { Assignee::Human } else { Assignee::Agent };
+                let patch = PatchCard { assignee: Some(next.as_str().into()), ..Default::default() };
                 let card = service::update_card(state, arg, patch, origin()).await?;
                 bot.edit(chat_id, message_id, &card_text(&card), card_keyboard(&card)).await?;
                 Ok(Some(if next == Assignee::Agent { "Handed to 🤖 Agent".into() } else { "Assigned to 👤 you".into() }))
@@ -590,11 +593,11 @@ fn tag_label(tag: &str) -> &'static str {
     }
 }
 
-fn assignee_label(a: &str) -> &'static str {
-    if a == "agent" {
-        "🤖 Agent"
-    } else {
-        "👤 Me"
+fn assignee_label(a: &str) -> String {
+    match a {
+        "human" => "👤 Me".into(),
+        "agent" => "🤖 Agent".into(),
+        other => format!("🤖 {}", esc(other)),
     }
 }
 
@@ -630,7 +633,7 @@ fn card_keyboard(card: &Card) -> Value {
             .map(|(col, label)| button(label, format!("move:{id}:{col}")))
             .collect()
     };
-    let toggle = if card.assignee == "agent" { "👤 Assign Me" } else { "🤖 Assign Agent" };
+    let toggle = if card.assignee != "human" { "👤 Assign Me" } else { "🤖 Assign Agent" };
     json!({ "inline_keyboard": [
         moves,
         [button(toggle, format!("toggle_assignee:{id}")), button("🗑 Delete", format!("delete:{id}"))],
@@ -685,7 +688,7 @@ async fn board_view(state: &AppState) -> Result<(String, Value), AppError> {
             continue;
         }
         for card in &col.cards {
-            let who = if card.assignee == "agent" { "🤖" } else { "👤" };
+            let who = if card.assignee != "human" { "🤖" } else { "👤" };
             text.push_str(&format!("\n   {who} {}", esc(&truncate(&card.title, 48))));
             if rows.len() < MAX_BOARD_BUTTONS {
                 let label = format!("{} {}", column_emoji(id), truncate(&card.title, 40));

@@ -12,7 +12,8 @@ use crate::{
 };
 
 const GAP: f64 = 1024.0;
-const CARD_COLS: &str = "id, column_id, title, description, tag, assignee, position, updated_at";
+const CARD_COLS: &str =
+    "id, column_id, title, description, tag, assignee, status, priority, pr_url, position, updated_at";
 
 /// Column the Build/Sell ratio counts as "shipped".
 pub const DONE_COLUMN: &str = "done";
@@ -34,6 +35,70 @@ fn clean_title(raw: &str) -> AppResult<String> {
 
 fn clean_description(raw: Option<String>) -> Option<String> {
     raw.filter(|d| !d.trim().is_empty())
+}
+
+fn clean_assignee(raw: &str) -> AppResult<String> {
+    let a = raw.trim();
+    if a.is_empty() {
+        return Err(AppError::BadRequest("assignee must not be empty".into()));
+    }
+    if a.chars().count() > 64 || a.chars().any(char::is_control) {
+        return Err(AppError::BadRequest("assignee must be at most 64 printable chars".into()));
+    }
+    Ok(a.to_ascii_lowercase())
+}
+
+fn clean_pr_url(raw: Option<String>) -> AppResult<Option<String>> {
+    match raw {
+        None => Ok(None),
+        Some(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return Ok(None);
+            }
+            if trimmed.chars().count() > 2048 || trimmed.chars().any(char::is_control) {
+                return Err(AppError::BadRequest("pr_url is invalid or too long".into()));
+            }
+            Ok(Some(trimmed.to_string()))
+        }
+    }
+}
+
+pub fn status_for_column(col: &str) -> &'static str {
+    match col {
+        "backlog" => "todo",
+        "build" => "in_progress",
+        "sell" => "sell",
+        "done" => "done",
+        _ => "todo",
+    }
+}
+
+pub fn normalize_status(raw: &str) -> AppResult<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "todo" | "backlog" => Ok("todo"),
+        "in_progress" | "in-progress" | "in progress" | "build" => Ok("in_progress"),
+        "review" => Ok("review"),
+        "sell" => Ok("sell"),
+        "done" => Ok("done"),
+        other => Err(AppError::BadRequest(format!(
+            "unknown status '{other}' — use todo, in_progress, review, sell, or done"
+        ))),
+    }
+}
+
+fn target_column_for_status(status: &str, current_column: Option<&str>) -> &'static str {
+    match status {
+        "todo" => "backlog",
+        "in_progress" => "build",
+        "review" => match current_column {
+            Some("sell") => "sell",
+            _ => "build",
+        },
+        "sell" => "sell",
+        "done" => DONE_COLUMN,
+        _ => "backlog",
+    }
 }
 
 fn check_position(p: f64) -> AppResult<f64> {
@@ -81,7 +146,7 @@ async fn top_position(state: &AppState, column_id: &str) -> AppResult<f64> {
 async fn save_card(state: &AppState, c: &Card) -> AppResult<()> {
     sqlx::query(
         "UPDATE cards SET column_id = ?, title = ?, description = ?, tag = ?, assignee = ?,
-                          position = ?, updated_at = ?
+                          status = ?, priority = ?, pr_url = ?, position = ?, updated_at = ?
          WHERE id = ?",
     )
     .bind(&c.column_id)
@@ -89,6 +154,9 @@ async fn save_card(state: &AppState, c: &Card) -> AppResult<()> {
     .bind(&c.description)
     .bind(&c.tag)
     .bind(&c.assignee)
+    .bind(&c.status)
+    .bind(c.priority)
+    .bind(&c.pr_url)
     .bind(c.position)
     .bind(&c.updated_at)
     .bind(&c.id)
@@ -172,6 +240,15 @@ pub async fn create_card(state: &AppState, input: CreateCard, origin: Option<Str
         Some(p) => check_position(p)?,
         None => end_position(state, &input.column_id).await?,
     };
+    let assignee = match input.assignee {
+        Some(a) => clean_assignee(&a)?,
+        None => Assignee::Human.as_str().into(),
+    };
+    let status = match input.status {
+        Some(s) => normalize_status(&s)?.into(),
+        None => status_for_column(&input.column_id).into(),
+    };
+    let pr_url = clean_pr_url(input.pr_url)?;
 
     let card = Card {
         id: input.id.unwrap_or_else(uuid::Uuid::new_v4).to_string(),
@@ -179,14 +256,17 @@ pub async fn create_card(state: &AppState, input: CreateCard, origin: Option<Str
         title,
         description: clean_description(input.description),
         tag: input.tag.unwrap_or(Tag::Build).as_str().into(),
-        assignee: input.assignee.unwrap_or(Assignee::Human).as_str().into(),
+        assignee,
+        status,
+        priority: input.priority.unwrap_or(0),
+        pr_url,
         position,
         updated_at: now(),
     };
 
     let res = sqlx::query(
-        "INSERT INTO cards (id, column_id, title, description, tag, assignee, position, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO cards (id, column_id, title, description, tag, assignee, status, priority, pr_url, position, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&card.id)
     .bind(&card.column_id)
@@ -194,6 +274,9 @@ pub async fn create_card(state: &AppState, input: CreateCard, origin: Option<Str
     .bind(&card.description)
     .bind(&card.tag)
     .bind(&card.assignee)
+    .bind(&card.status)
+    .bind(card.priority)
+    .bind(&card.pr_url)
     .bind(card.position)
     .bind(&card.updated_at)
     .execute(&state.pool)
@@ -213,6 +296,7 @@ pub async fn create_card(state: &AppState, input: CreateCard, origin: Option<Str
 pub async fn update_card(state: &AppState, id: &str, patch: PatchCard, origin: Option<String>) -> AppResult<Card> {
     let mut card = fetch_card(state, id).await?;
     let mut moved = false;
+    let has_explicit_column = patch.column_id.is_some();
 
     if let Some(col) = patch.column_id {
         if col != card.column_id {
@@ -226,6 +310,27 @@ pub async fn update_card(state: &AppState, id: &str, patch: PatchCard, origin: O
                 } else {
                     end_position(state, &card.column_id).await?
                 };
+            }
+            if patch.status.is_none() {
+                card.status = status_for_column(&card.column_id).into();
+            }
+        }
+    }
+    if let Some(s) = patch.status {
+        let normalized = normalize_status(&s)?;
+        card.status = normalized.into();
+        if !has_explicit_column {
+            let target_col = target_column_for_status(normalized, Some(&card.column_id));
+            if target_col != card.column_id {
+                card.column_id = target_col.into();
+                moved = true;
+                if patch.position.is_none() {
+                    card.position = if card.column_id == DONE_COLUMN {
+                        top_position(state, &card.column_id).await?
+                    } else {
+                        end_position(state, &card.column_id).await?
+                    };
+                }
             }
         }
     }
@@ -246,7 +351,13 @@ pub async fn update_card(state: &AppState, id: &str, patch: PatchCard, origin: O
         card.tag = tag.as_str().into();
     }
     if let Some(a) = patch.assignee {
-        card.assignee = a.as_str().into();
+        card.assignee = clean_assignee(&a)?;
+    }
+    if let Some(priority) = patch.priority {
+        card.priority = priority;
+    }
+    if let Some(pr_url) = patch.pr_url {
+        card.pr_url = clean_pr_url(Some(pr_url))?;
     }
 
     card.updated_at = now();
@@ -303,6 +414,7 @@ pub async fn agent_action(state: &AppState, input: AgentAction, origin: Option<S
     };
 
     if let Some(col) = target {
+        card.status = status_for_column(col).into();
         if col != card.column_id {
             card.column_id = col.into();
             card.position = top_position(state, col).await?;
@@ -333,4 +445,126 @@ pub async fn agent_action(state: &AppState, input: AgentAction, origin: Option<S
     let kind = if card.column_id != from_column { "CARD_MOVED" } else { "CARD_UPDATED" };
     state.emit(kind, json!({ "card": card }), origin);
     Ok(card)
+}
+
+pub async fn list_tasks(
+    state: &AppState,
+    assignee: Option<&str>,
+    status: Option<&str>,
+    limit: usize,
+) -> AppResult<Vec<Card>> {
+    let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(format!("SELECT {CARD_COLS} FROM cards"));
+    let mut has_where = false;
+
+    if let Some(a) = assignee.map(str::trim).filter(|s| !s.is_empty()) {
+        qb.push(" WHERE LOWER(assignee) = LOWER(");
+        qb.push_bind(a);
+        qb.push(")");
+        has_where = true;
+    }
+
+    if let Some(raw_status) = status.map(str::trim).filter(|s| !s.is_empty()) {
+        let lower = raw_status.to_ascii_lowercase();
+        let (col_filter, status_filter) = match lower.as_str() {
+            "backlog" | "build" | "sell" => (Some(lower.as_str()), None),
+            "todo" => (None, Some("todo")),
+            "in_progress" | "in-progress" | "in progress" => (None, Some("in_progress")),
+            "review" => (None, Some("review")),
+            "done" => (None, Some("done")),
+            _ => {
+                return Err(AppError::BadRequest(format!(
+                    "unknown status '{raw_status}' — use todo, in_progress, review, done, backlog, build, or sell"
+                )));
+            }
+        };
+        qb.push(if has_where { " AND " } else { " WHERE " });
+        if let Some(col) = col_filter {
+            qb.push("column_id = ");
+            qb.push_bind(col.to_string());
+        } else if let Some(st) = status_filter {
+            qb.push("status = ");
+            qb.push_bind(st.to_string());
+        }
+    }
+
+    qb.push(" ORDER BY priority DESC, position ASC, updated_at ASC LIMIT ");
+    qb.push_bind(limit as i64);
+
+    let cards = qb.build_query_as::<Card>().fetch_all(&state.pool).await?;
+    Ok(cards)
+}
+
+pub async fn list_comments(state: &AppState, card_id: &str) -> AppResult<Vec<CardComment>> {
+    let comments = sqlx::query_as::<_, CardComment>(
+        "SELECT id, card_id, author, comment, created_at
+         FROM card_comments
+         WHERE card_id = ?
+         ORDER BY created_at ASC, rowid ASC",
+    )
+    .bind(card_id)
+    .fetch_all(&state.pool)
+    .await?;
+    Ok(comments)
+}
+
+pub async fn add_card_comment(
+    state: &AppState,
+    card_id: &str,
+    author: Option<&str>,
+    comment: &str,
+    origin: Option<String>,
+) -> AppResult<(Card, CardComment)> {
+    let comment_text = comment.trim();
+    if comment_text.is_empty() {
+        return Err(AppError::BadRequest("comment must not be empty".into()));
+    }
+    if comment_text.chars().count() > 20_000 {
+        return Err(AppError::BadRequest("comment is too long (max 20000 chars)".into()));
+    }
+    let author_text = match author.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(a) => clean_assignee(a)?,
+        None => "agent".into(),
+    };
+
+    let mut card = resolve_card(state, card_id).await?;
+    let created_at = now();
+    let comment_row = CardComment {
+        id: uuid::Uuid::new_v4().to_string(),
+        card_id: card.id.clone(),
+        author: author_text,
+        comment: comment_text.to_string(),
+        created_at: created_at.clone(),
+    };
+
+    let stamp = chrono::Utc::now().format("%Y-%m-%d %H:%M UTC");
+    let entry = format!("💬 **{}** · _{stamp}_\n\n{}", comment_row.author, comment_row.comment);
+    card.description = Some(match card.description.take() {
+        Some(d) if !d.trim().is_empty() => format!("{d}\n\n---\n\n{entry}"),
+        _ => entry,
+    });
+    card.updated_at = created_at;
+
+    let mut tx = state.pool.begin().await?;
+    sqlx::query(
+        "INSERT INTO card_comments (id, card_id, author, comment, created_at)
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(&comment_row.id)
+    .bind(&comment_row.card_id)
+    .bind(&comment_row.author)
+    .bind(&comment_row.comment)
+    .bind(&comment_row.created_at)
+    .execute(&mut *tx)
+    .await?;
+
+    sqlx::query("UPDATE cards SET description = ?, updated_at = ? WHERE id = ?")
+        .bind(&card.description)
+        .bind(&card.updated_at)
+        .bind(&card.id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+
+    state.emit("CARD_UPDATED", json!({ "card": card }), origin);
+    Ok((card, comment_row))
 }

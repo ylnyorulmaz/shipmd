@@ -16,8 +16,20 @@ pub struct Card {
     pub description: Option<String>,
     pub tag: String,
     pub assignee: String,
+    pub status: String,
+    pub priority: i64,
+    pub pr_url: Option<String>,
     pub position: f64,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, FromRow)]
+pub struct CardComment {
+    pub id: String,
+    pub card_id: String,
+    pub author: String,
+    pub comment: String,
+    pub created_at: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -75,7 +87,10 @@ pub struct CreateCard {
     pub title: String,
     pub description: Option<String>,
     pub tag: Option<Tag>,
-    pub assignee: Option<Assignee>,
+    pub assignee: Option<String>,
+    pub status: Option<String>,
+    pub priority: Option<i64>,
+    pub pr_url: Option<String>,
     /// Omit to append to the end of the column.
     pub position: Option<f64>,
 }
@@ -88,7 +103,11 @@ pub struct PatchCard {
     /// An empty string clears the description.
     pub description: Option<String>,
     pub tag: Option<Tag>,
-    pub assignee: Option<Assignee>,
+    pub assignee: Option<String>,
+    pub status: Option<String>,
+    pub priority: Option<i64>,
+    /// An empty string clears pr_url.
+    pub pr_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
