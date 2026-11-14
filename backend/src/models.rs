@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
-use sqlx::FromRow;
+use serde::{Deserialize, Deserializer, Serialize};
+use sqlx::{sqlite::SqliteRow, FromRow, Row};
 
 #[derive(Debug, Clone, Serialize, FromRow)]
 pub struct Column {
@@ -8,7 +8,7 @@ pub struct Column {
     pub position: i64,
 }
 
-#[derive(Debug, Clone, Serialize, FromRow)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Card {
     pub id: String,
     pub column_id: String,
@@ -19,8 +19,63 @@ pub struct Card {
     pub status: String,
     pub priority: i64,
     pub pr_url: Option<String>,
+    pub repo: Option<String>,
+    pub labels: Vec<String>,
     pub position: f64,
     pub updated_at: String,
+}
+
+/// Normalize stored labels (`["frontend","bug"]` JSON array or `"frontend, bug"` CSV).
+pub fn parse_stored_labels(raw: Option<&str>) -> Vec<String> {
+    let Some(s) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Vec::new();
+    };
+    let items: Vec<String> = if s.starts_with('[') {
+        serde_json::from_str(s).unwrap_or_else(|_| vec![s.to_string()])
+    } else {
+        s.split(',').map(ToString::to_string).collect()
+    };
+    normalize_label_list(items)
+}
+
+/// Strip leading `#`, lowercase, deduplicate, and drop empty entries.
+pub fn normalize_label_list<I, S>(items: I) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut out = Vec::new();
+    for item in items {
+        for part in item.as_ref().split(',') {
+            let cleaned = part.trim().trim_start_matches('#').trim().to_ascii_lowercase();
+            if cleaned.is_empty() || out.contains(&cleaned) {
+                continue;
+            }
+            out.push(cleaned);
+        }
+    }
+    out
+}
+
+impl<'r> FromRow<'r, SqliteRow> for Card {
+    fn from_row(row: &'r SqliteRow) -> Result<Self, sqlx::Error> {
+        let labels_raw: Option<String> = row.try_get("labels")?;
+        Ok(Self {
+            id: row.try_get("id")?,
+            column_id: row.try_get("column_id")?,
+            title: row.try_get("title")?,
+            description: row.try_get("description")?,
+            tag: row.try_get("tag")?,
+            assignee: row.try_get("assignee")?,
+            status: row.try_get("status")?,
+            priority: row.try_get("priority")?,
+            pr_url: row.try_get("pr_url")?,
+            repo: row.try_get("repo")?,
+            labels: parse_stored_labels(labels_raw.as_deref()),
+            position: row.try_get("position")?,
+            updated_at: row.try_get("updated_at")?,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, FromRow)]
@@ -79,6 +134,26 @@ impl Assignee {
     }
 }
 
+fn deserialize_opt_labels<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum LabelsInput {
+        List(Vec<String>),
+        Csv(String),
+    }
+
+    match Option::<LabelsInput>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(LabelsInput::List(list)) => Ok(Some(list)),
+        Some(LabelsInput::Csv(s)) => Ok(Some(
+            s.split(',').map(ToString::to_string).collect(),
+        )),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct CreateCard {
     /// Optional client-generated UUID so optimistic UI keeps a stable identity.
@@ -91,6 +166,9 @@ pub struct CreateCard {
     pub status: Option<String>,
     pub priority: Option<i64>,
     pub pr_url: Option<String>,
+    pub repo: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_opt_labels")]
+    pub labels: Option<Vec<String>>,
     /// Omit to append to the end of the column.
     pub position: Option<f64>,
 }
@@ -108,6 +186,10 @@ pub struct PatchCard {
     pub priority: Option<i64>,
     /// An empty string clears pr_url.
     pub pr_url: Option<String>,
+    /// An empty string clears repo.
+    pub repo: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_opt_labels")]
+    pub labels: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]

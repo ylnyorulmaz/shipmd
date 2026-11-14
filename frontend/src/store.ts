@@ -3,7 +3,7 @@ import { createStore, produce, reconcile } from 'solid-js/store';
 import { api, CLIENT_ID, uuid, wsUrl } from './api';
 import { flip, prefersReducedMotion } from './flip';
 import { ASSIGNEE_PRESETS, type Assignee, type Card, type CardPatch, type Column, type Tag, type WsEvent } from './types';
-import { normalizeAssignee } from './ui';
+import { normalizeAssignee, normalizeLabels, normalizeRepo } from './ui';
 
 export const GAP = 1024;
 
@@ -27,10 +27,20 @@ export const [board, setBoard] = createStore<BoardState>({
 
 export const [connected, setConnected] = createSignal(false);
 export const [openCardId, setOpenCardId] = createSignal<string | null>(null);
+export const [createModalOpen, setCreateModalOpen] = createSignal(false);
 /** Column whose inline "add card" composer is open. */
 export const [composerColumn, setComposerColumn] = createSignal<string | null>(null);
-/** Active assignee filter (`null` shows all cards). */
+/** Active filters (`null` shows all cards). */
 export const [assigneeFilter, setAssigneeFilter] = createSignal<string | null>(null);
+export const [repoFilter, setRepoFilter] = createSignal<string | null>(null);
+export const [labelFilter, setLabelFilter] = createSignal<string | null>(null);
+
+export const hasActiveFilters = () => Boolean(assigneeFilter() || repoFilter() || labelFilter());
+export function clearAllFilters() {
+  setAssigneeFilter(null);
+  setRepoFilter(null);
+  setLabelFilter(null);
+}
 
 export const [toast, setToast] = createSignal<string | null>(null);
 let toastTimer: number | undefined;
@@ -47,14 +57,25 @@ export function showToast(msg: string) {
 export function sortedCardsIn(columnId: string): Card[] {
   const out: Card[] = [];
   for (const c of Object.values(board.cards)) if (c.column_id === columnId) out.push(c);
-  return out.sort((a, b) => a.position - b.position);
+  return out.sort((a, b) => {
+    const pd = (b.priority ?? 0) - (a.priority ?? 0);
+    if (pd !== 0) return pd;
+    return a.position - b.position;
+  });
 }
 
 export function visibleCardsIn(columnId: string): Card[] {
-  const filter = assigneeFilter();
+  const aFilter = assigneeFilter();
+  const rFilter = repoFilter();
+  const lFilter = labelFilter();
   const cards = sortedCardsIn(columnId);
-  if (!filter) return cards;
-  return cards.filter((c) => normalizeAssignee(c.assignee) === filter);
+  if (!aFilter && !rFilter && !lFilter) return cards;
+  return cards.filter((c) => {
+    if (aFilter && normalizeAssignee(c.assignee) !== aFilter) return false;
+    if (rFilter && normalizeRepo(c.repo ?? '') !== rFilter) return false;
+    if (lFilter && !normalizeLabels(c.labels).includes(lFilter)) return false;
+    return true;
+  });
 }
 
 export const doneColumnId = () => board.columns[board.columns.length - 1]?.id;
@@ -106,11 +127,24 @@ export async function updateCard(id: string, patch: CardPatch) {
     if (!cleaned) return;
     normalizedPatch.assignee = cleaned;
   }
+  if (normalizedPatch.labels !== undefined) {
+    normalizedPatch.labels = normalizeLabels(normalizedPatch.labels);
+  }
   const prev: Partial<Card> = {};
   for (const k of Object.keys(normalizedPatch) as (keyof CardPatch)[]) (prev as any)[k] = card[k];
   const local: Partial<Card> = { ...normalizedPatch } as Partial<Card>;
   if (normalizedPatch.description !== undefined) {
     local.description = normalizedPatch.description.trim() ? normalizedPatch.description : null;
+  }
+  if (normalizedPatch.repo !== undefined) {
+    const cleanedRepo = normalizeRepo(normalizedPatch.repo ?? '');
+    local.repo = cleanedRepo || null;
+    normalizedPatch.repo = cleanedRepo;
+  }
+  if (normalizedPatch.pr_url !== undefined) {
+    const cleanedPr = (normalizedPatch.pr_url ?? '').trim();
+    local.pr_url = cleanedPr || null;
+    normalizedPatch.pr_url = cleanedPr;
   }
   setBoard('cards', id, local);
   try {
@@ -131,16 +165,32 @@ export function toggleAssignee(id: string) {
   return updateCard(id, { assignee: next });
 }
 
-export async function createCard(input: { column_id: string; title: string; tag: Tag; assignee: Assignee }) {
+export async function createCard(input: {
+  column_id: string;
+  title: string;
+  description?: string | null;
+  tag: Tag;
+  assignee: Assignee;
+  repo?: string | null;
+  priority?: number;
+  labels?: string[];
+}) {
   const last = sortedCardsIn(input.column_id).at(-1);
   const assignee = normalizeAssignee(input.assignee) || 'human';
+  const repo = input.repo ? normalizeRepo(input.repo) || null : null;
+  const labels = normalizeLabels(input.labels);
+  const description = input.description?.trim() ? input.description : null;
+  const priority = input.priority ?? 0;
   const card: Card = {
     id: uuid(),
     column_id: input.column_id,
     title: input.title,
-    description: null,
+    description,
     tag: input.tag,
     assignee,
+    priority,
+    repo,
+    labels,
     position: last ? last.position + GAP : GAP,
     updated_at: new Date().toISOString(),
   };

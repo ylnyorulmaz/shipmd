@@ -2,8 +2,19 @@ import { For, onCleanup, onMount, Show } from 'solid-js';
 import AssigneeFilterBar from './components/AssigneeFilterBar';
 import BoardColumn from './components/BoardColumn';
 import CardModal from './components/CardModal';
+import CreateCardModal from './components/CreateCardModal';
 import Header from './components/Header';
-import { board, composerColumn, connectSocket, loadBoard, openCardId, setComposerColumn, toast } from './store';
+import {
+  board,
+  composerColumn,
+  connectSocket,
+  createModalOpen,
+  loadBoard,
+  openCardId,
+  setComposerColumn,
+  setCreateModalOpen,
+  toast,
+} from './store';
 
 const isTyping = (t: EventTarget | null) =>
   t instanceof HTMLElement && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName));
@@ -19,9 +30,17 @@ export default function App() {
       if (composerColumn()) setComposerColumn(null);
       return;
     }
-    if ((e.key === 'n' || e.key === 'N') && !e.metaKey && !e.ctrlKey && !e.altKey && !isTyping(e.target) && !openCardId()) {
+    if (
+      (e.key === 'n' || e.key === 'N') &&
+      !e.metaKey &&
+      !e.ctrlKey &&
+      !e.altKey &&
+      !isTyping(e.target) &&
+      !openCardId() &&
+      !createModalOpen()
+    ) {
       e.preventDefault();
-      setComposerColumn(board.columns[0]?.id ?? null);
+      setCreateModalOpen(true);
     }
   };
   window.addEventListener('keydown', onKey);
@@ -49,6 +68,9 @@ export default function App() {
       </main>
 
       <Show when={openCardId()}>{(id) => <CardModal id={id()} />}</Show>
+      <Show when={createModalOpen()}>
+        <CreateCardModal />
+      </Show>
 
       <Show when={toast()}>
         <div class="toast-in fixed bottom-5 left-1/2 z-[70] -translate-x-1/2 rounded-md bg-slate-900 px-4 py-2.5 text-sm text-white shadow-lg dark:bg-zinc-100 dark:text-zinc-900">

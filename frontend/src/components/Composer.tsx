@@ -7,13 +7,14 @@ const MENTION_ALIASES: Record<string, Assignee> = {
   me: 'human',
   human: 'human',
   antigravity: 'antigravity',
+  kimi: 'kimi',
   hermes: 'hermes',
   agent: 'agent',
   bot: 'agent',
   ai: 'agent',
 };
 
-/** Inline Trello-style "add a card" composer. Supports `#build #sell #ops` and `@antigravity @hermes @agent` tokens. */
+/** Inline Trello-style "add a card" composer. Supports `#build #sell #ops` and `@antigravity @kimi @hermes @agent` tokens. */
 export default function Composer(props: { columnId: string }) {
   let input!: HTMLTextAreaElement;
   const [tag, setTag] = createSignal<Tag>(props.columnId === 'sell' ? 'sell' : 'build');
@@ -29,7 +30,7 @@ export default function Composer(props: { columnId: string }) {
     let t = tag();
     let a = assignee();
     title = title.replace(/(^|\s)#(build|sell|ops)\b/gi, (_, sp, m: string) => ((t = m.toLowerCase() as Tag), sp));
-    title = title.replace(/(^|\s)@(me|human|antigravity|hermes|agent|bot|ai)\b/gi, (_, sp, m: string) => {
+    title = title.replace(/(^|\s)@(me|human|antigravity|kimi|hermes|agent|bot|ai)\b/gi, (_, sp, m: string) => {
       a = MENTION_ALIASES[m.toLowerCase()] ?? a;
       return sp;
     });

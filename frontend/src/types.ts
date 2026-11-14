@@ -1,8 +1,17 @@
 export type Tag = 'build' | 'sell' | 'ops';
-export type BuiltinAssignee = 'human' | 'antigravity' | 'hermes' | 'agent';
+export type BuiltinAssignee = 'human' | 'antigravity' | 'kimi' | 'hermes' | 'agent';
 export type Assignee = BuiltinAssignee | (string & {});
 
-export const ASSIGNEE_PRESETS: readonly BuiltinAssignee[] = ['human', 'antigravity', 'hermes', 'agent'];
+export const ASSIGNEE_PRESETS: readonly BuiltinAssignee[] = ['human', 'antigravity', 'kimi', 'hermes', 'agent'];
+
+export const REPO_PRESETS = ['shipmd', 'ceviz-ai', 'antisocial', 'kahvefalim'] as const;
+
+export const PRIORITY_OPTIONS = [
+  { value: 0, label: 'Low', short: 'Low' },
+  { value: 5, label: 'Normal', short: 'Normal' },
+  { value: 8, label: 'High', short: 'High' },
+  { value: 10, label: 'Urgent', short: 'Urgent' },
+] as const;
 
 export interface Card {
   id: string;
@@ -14,6 +23,8 @@ export interface Card {
   status?: string;
   priority?: number;
   pr_url?: string | null;
+  repo?: string | null;
+  labels?: string[];
   position: number;
   updated_at: string;
 }
@@ -29,7 +40,9 @@ export interface BoardResponse {
   columns: (Column & { cards: Card[] })[];
 }
 
-export type CardPatch = Partial<Pick<Card, 'column_id' | 'position' | 'title' | 'tag' | 'assignee'>> & {
+export type CardPatch = Partial<
+  Pick<Card, 'column_id' | 'position' | 'title' | 'tag' | 'assignee' | 'priority' | 'repo' | 'labels' | 'pr_url'>
+> & {
   description?: string;
 };
 

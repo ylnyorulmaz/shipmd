@@ -3,7 +3,17 @@ import { apiOrigin } from '../api';
 import { renderMarkdown } from '../markdown';
 import { board, deleteCard, setOpenCardId, updateCard } from '../store';
 import { TAGS } from '../types';
-import { AssigneePicker, normalizeAssignee, TAG_LABEL, TAG_SOLID } from '../ui';
+import {
+  AssigneePicker,
+  LabelsInput,
+  normalizeAssignee,
+  normalizeLabels,
+  PrBadge,
+  PriorityPicker,
+  RepoPicker,
+  TAG_LABEL,
+  TAG_SOLID,
+} from '../ui';
 
 function timeAgo(iso: string): string {
   const s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
@@ -72,16 +82,16 @@ export default function CardModal(props: { id: string }) {
     setOpenCardId(null);
   };
 
-  // Escape closes (saving any in-progress edits); handled here so it wins over the global handler.
+  // Escape closes (saving any in-progress edits); bubble phase lets inline custom inputs handle Escape first.
   const onKey = (e: KeyboardEvent) => {
-    if (e.key === 'Escape') {
+    if (e.key === 'Escape' && !e.defaultPrevented) {
       e.preventDefault();
       e.stopImmediatePropagation();
       close();
     }
   };
-  window.addEventListener('keydown', onKey, true);
-  onCleanup(() => window.removeEventListener('keydown', onKey, true));
+  window.addEventListener('keydown', onKey);
+  onCleanup(() => window.removeEventListener('keydown', onKey));
 
   const copy = async (label: string, text: string) => {
     try {
@@ -181,6 +191,59 @@ export default function CardModal(props: { id: string }) {
                 }}
               />
             </div>
+            <div class="sm:col-span-2">
+              <div class="mb-1.5 text-[11px] font-semibold tracking-wide text-slate-500 uppercase dark:text-zinc-500">
+                Repo / Project
+              </div>
+              <RepoPicker
+                size="md"
+                value={card()!.repo ?? null}
+                onChange={(next) => {
+                  if ((next ?? null) !== (card()!.repo ?? null)) {
+                    void updateCard(props.id, { repo: next ?? '' });
+                  }
+                }}
+              />
+            </div>
+            <div class="sm:col-span-2">
+              <div class="mb-1.5 text-[11px] font-semibold tracking-wide text-slate-500 uppercase dark:text-zinc-500">Priority</div>
+              <PriorityPicker
+                size="md"
+                value={card()!.priority ?? 0}
+                onChange={(next) => {
+                  if (next !== (card()!.priority ?? 0)) {
+                    void updateCard(props.id, { priority: next });
+                  }
+                }}
+              />
+            </div>
+            <div class="sm:col-span-2">
+              <div class="mb-1.5 text-[11px] font-semibold tracking-wide text-slate-500 uppercase dark:text-zinc-500">
+                Labels <span class="font-normal normal-case opacity-70">(#etiket, Enter or comma)</span>
+              </div>
+              <LabelsInput
+                value={normalizeLabels(card()!.labels)}
+                onChange={(next) => {
+                  void updateCard(props.id, { labels: next });
+                }}
+              />
+            </div>
+            <Show when={card()!.pr_url}>
+              {(url) => (
+                <div class="sm:col-span-2 flex items-center gap-2">
+                  <span class="text-[11px] font-semibold tracking-wide text-slate-500 uppercase dark:text-zinc-500">Pull Request</span>
+                  <PrBadge url={url()} />
+                  <a
+                    href={url()}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    class="truncate text-xs text-sky-600 underline underline-offset-2 dark:text-sky-400"
+                  >
+                    {url()}
+                  </a>
+                </div>
+              )}
+            </Show>
           </div>
 
           {/* Description */}

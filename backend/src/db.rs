@@ -22,6 +22,8 @@ CREATE TABLE IF NOT EXISTS cards (
     status      TEXT NOT NULL DEFAULT 'todo',
     priority    INTEGER NOT NULL DEFAULT 0,
     pr_url      TEXT,
+    repo        TEXT,
+    labels      TEXT NOT NULL DEFAULT '[]',
     position    REAL NOT NULL,
     updated_at  TEXT NOT NULL
 );
@@ -153,6 +155,8 @@ pub async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
                     status      TEXT NOT NULL DEFAULT 'todo',
                     priority    INTEGER NOT NULL DEFAULT 0,
                     pr_url      TEXT,
+                    repo        TEXT,
+                    labels      TEXT NOT NULL DEFAULT '[]',
                     position    REAL NOT NULL,
                     updated_at  TEXT NOT NULL
                 )",
@@ -183,10 +187,16 @@ pub async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
                 "0"
             };
             let pr_url_expr = if existing_cols.contains("pr_url") { "pr_url" } else { "NULL" };
+            let repo_expr = if existing_cols.contains("repo") { "repo" } else { "NULL" };
+            let labels_expr = if existing_cols.contains("labels") {
+                "COALESCE(NULLIF(TRIM(labels), ''), '[]')"
+            } else {
+                "'[]'"
+            };
 
             let copy_sql = format!(
-                "INSERT INTO cards_migrated (id, column_id, title, description, tag, assignee, status, priority, pr_url, position, updated_at)
-                 SELECT id, column_id, title, description, tag, {assignee_expr}, {status_expr}, {priority_expr}, {pr_url_expr}, position, updated_at
+                "INSERT INTO cards_migrated (id, column_id, title, description, tag, assignee, status, priority, pr_url, repo, labels, position, updated_at)
+                 SELECT id, column_id, title, description, tag, {assignee_expr}, {status_expr}, {priority_expr}, {pr_url_expr}, {repo_expr}, {labels_expr}, position, updated_at
                  FROM cards"
             );
             sqlx::query(&copy_sql).execute(&mut *tx).await?;
@@ -239,9 +249,24 @@ pub async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
                 .await?;
             tracing::info!("migrated cards table: added pr_url column");
         }
+        if !existing_cols.contains("repo") {
+            sqlx::query("ALTER TABLE cards ADD COLUMN repo TEXT")
+                .execute(pool)
+                .await?;
+            tracing::info!("migrated cards table: added repo column");
+        }
+        if !existing_cols.contains("labels") {
+            sqlx::query("ALTER TABLE cards ADD COLUMN labels TEXT NOT NULL DEFAULT '[]'")
+                .execute(pool)
+                .await?;
+            tracing::info!("migrated cards table: added labels column");
+        }
     }
 
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_cards_priority ON cards(priority DESC, position ASC)")
+        .execute(pool)
+        .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_cards_repo ON cards(repo)")
         .execute(pool)
         .await?;
     Ok(())
@@ -275,8 +300,8 @@ async fn seed(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             _ => "todo",
         };
         sqlx::query(
-            "INSERT INTO cards (id, column_id, title, description, tag, assignee, status, priority, pr_url, position, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?)",
+            "INSERT INTO cards (id, column_id, title, description, tag, assignee, status, priority, pr_url, repo, labels, position, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, 0, NULL, NULL, '[]', ?, ?)",
         )
         .bind(uuid::Uuid::new_v4().to_string())
         .bind(col)
@@ -333,28 +358,83 @@ mod tests {
 
         let migrated = connect(&path).await.unwrap();
 
-        let (status, priority, pr_url): (String, i64, Option<String>) =
-            sqlx::query_as("SELECT status, priority, pr_url FROM cards WHERE id = 'c1'")
+        let (status, priority, pr_url, repo, labels): (String, i64, Option<String>, Option<String>, String) =
+            sqlx::query_as("SELECT status, priority, pr_url, repo, labels FROM cards WHERE id = 'c1'")
                 .fetch_one(&migrated)
                 .await
                 .unwrap();
         assert_eq!(status, "in_progress");
         assert_eq!(priority, 0);
         assert!(pr_url.is_none());
+        assert!(repo.is_none());
+        assert_eq!(labels, "[]");
 
         sqlx::query(
-            "INSERT INTO cards (id, column_id, title, description, tag, assignee, status, priority, pr_url, position, updated_at)
-             VALUES ('c2', 'backlog', 'Hermes task', NULL, 'build', 'hermes', 'todo', 5, 'https://github.com/org/repo/pull/1', 2048.0, '2026-01-01T00:00:00Z')",
+            "INSERT INTO cards (id, column_id, title, description, tag, assignee, status, priority, pr_url, repo, labels, position, updated_at)
+             VALUES ('c2', 'backlog', 'Hermes task', NULL, 'build', 'hermes', 'todo', 5, 'https://github.com/org/repo/pull/1', 'shipmd', '[\"frontend\",\"bug\"]', 2048.0, '2026-01-01T00:00:00Z')",
         )
         .execute(&migrated)
         .await
         .unwrap();
 
-        let (assignee,): (String,) = sqlx::query_as("SELECT assignee FROM cards WHERE id = 'c2'")
-            .fetch_one(&migrated)
-            .await
-            .unwrap();
+        let (assignee, repo2, labels2): (String, Option<String>, String) =
+            sqlx::query_as("SELECT assignee, repo, labels FROM cards WHERE id = 'c2'")
+                .fetch_one(&migrated)
+                .await
+                .unwrap();
         assert_eq!(assignee, "hermes");
+        assert_eq!(repo2.as_deref(), Some("shipmd"));
+        assert_eq!(labels2, "[\"frontend\",\"bug\"]");
+
+        migrated.close().await;
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}-wal"));
+        let _ = std::fs::remove_file(format!("{path}-shm"));
+    }
+
+    #[tokio::test]
+    async fn migrates_existing_table_missing_repo_and_labels() {
+        let path = format!("/tmp/shipmd_migrate_repo_labels_{}.db", uuid::Uuid::new_v4());
+        let opts = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new().max_connections(1).connect_with(opts).await.unwrap();
+
+        sqlx::raw_sql(
+            r#"
+            CREATE TABLE columns (id TEXT PRIMARY KEY, title TEXT NOT NULL, position INTEGER NOT NULL);
+            CREATE TABLE cards (
+                id          TEXT PRIMARY KEY,
+                column_id   TEXT NOT NULL REFERENCES columns(id) ON DELETE CASCADE,
+                title       TEXT NOT NULL,
+                description TEXT,
+                tag         TEXT NOT NULL CHECK (tag IN ('build', 'sell', 'ops')),
+                assignee    TEXT NOT NULL DEFAULT 'human',
+                status      TEXT NOT NULL DEFAULT 'todo',
+                priority    INTEGER NOT NULL DEFAULT 0,
+                pr_url      TEXT,
+                position    REAL NOT NULL,
+                updated_at  TEXT NOT NULL
+            );
+            INSERT INTO columns (id, title, position) VALUES ('backlog', 'Backlog', 0);
+            INSERT INTO cards (id, column_id, title, description, tag, assignee, status, priority, pr_url, position, updated_at)
+            VALUES ('c1', 'backlog', 'Existing card', NULL, 'build', 'kimi', 'todo', 8, NULL, 1024.0, '2026-01-01T00:00:00Z');
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        let migrated = connect(&path).await.unwrap();
+        let (repo, labels): (Option<String>, String) =
+            sqlx::query_as("SELECT repo, labels FROM cards WHERE id = 'c1'")
+                .fetch_one(&migrated)
+                .await
+                .unwrap();
+        assert!(repo.is_none());
+        assert_eq!(labels, "[]");
 
         migrated.close().await;
         let _ = std::fs::remove_file(&path);
