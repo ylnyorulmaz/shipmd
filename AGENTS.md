@@ -4,7 +4,7 @@ Instructions for AI coding agents (Claude Code, Codex, Cursor, Copilot, …) wor
 
 ## Project in one paragraph
 
-Ship Board is a real-time Kanban board: a Rust backend and a SolidJS frontend. A single Axum process serves:
+ShipMD is a real-time Kanban board: a Rust backend and a SolidJS frontend. A single Axum process serves:
 - the REST API (`/api/*`)
 - a WebSocket (`/ws`) that sends every change
 - a Telegram long-polling bot
