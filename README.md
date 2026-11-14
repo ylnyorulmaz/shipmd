@@ -30,7 +30,7 @@ frontend/  SolidJS · TypeScript · Vite · Tailwind CSS v4
 | **Shortcuts** | `N` opens quick add. `Esc` closes dialogs. In quick add, `#sell` / `#ops` and `@agent` set the tag and assignee. |
 | **Agent HTTP endpoint** | `POST /api/agent/action` takes `start` / `complete` / `note` and accepts 8-character short ids. |
 | **Telegram bot** | `/board`, `/add`, `/ratio`, and plain-text quick add. Inline buttons move, reassign and delete cards. You get a notification when an agent finishes a task. |
-| **MCP server** | `POST /mcp` (Streamable HTTP) and `GET /mcp/sse` (legacy SSE) with 5 tools. AI coding agents can claim work, log progress and close tasks. |
+| **MCP server** | `POST /mcp` (Streamable HTTP) and `GET /mcp/sse` (legacy SSE) with 9 tools (`list_tasks`, `get_task_details`, `update_task_status`, `add_task_comment`, plus board helpers). Autonomous agents (Hermes, Antigravity, Claude Code, Cursor) can claim work, log progress and close tasks. |
 
 ## Architecture
 
@@ -79,7 +79,7 @@ The backend reads environment variables and loads `backend/.env` if it exists. R
 | `TELEGRAM_BOT_TOKEN` | — | Bot token from @BotFather. If unset, the bot is off. |
 | `TELEGRAM_ALLOWED_CHAT_ID` | — | Your numeric chat id. If set, the bot ignores every other chat. **Set this.** |
 | `TELEGRAM_API_URL` | `https://api.telegram.org` | Override for a self-hosted Bot API server or for tests |
-| `MCP_API_KEY` | — | If set, `/mcp` requires `Authorization: Bearer <key>`. If unset, only localhost can connect. |
+| `SHIPMD_MCP_TOKEN` | — | **Required for `/mcp`.** Clients must send `Authorization: Bearer <token>`. If unset, `/mcp` logs a warning and rejects all requests with `401 Unauthorized` (`MCP_API_KEY` is accepted as a legacy fallback). |
 
 Frontend: `API_URL` changes the target of the Vite dev proxy. `VITE_API_URL` makes the browser call the API directly instead of going through the proxy.
 
@@ -116,7 +116,7 @@ When an agent completes a card, the bot sends `🤖 Agent completed: "…" -> Mo
 
 ### From an AI coding agent (MCP)
 
-**Claude Code**: add this to `.mcp.json` in your project, or run `claude mcp add --transport http ship-board http://localhost:3001/mcp --header "Authorization: Bearer $MCP_API_KEY"`:
+**Claude Code / Hermes / Antigravity**: add this to `.mcp.json` in your project, or run `claude mcp add --transport http ship-board http://localhost:3001/mcp --header "Authorization: Bearer $SHIPMD_MCP_TOKEN"`:
 
 ```json
 {
@@ -124,29 +124,33 @@ When an agent completes a card, the bot sends `🤖 Agent completed: "…" -> Mo
     "ship-board": {
       "type": "http",
       "url": "http://localhost:3001/mcp",
-      "headers": { "Authorization": "Bearer YOUR_MCP_API_KEY" }
+      "headers": { "Authorization": "Bearer YOUR_SHIPMD_MCP_TOKEN" }
     }
   }
 }
 ```
 
-**Cursor**: use `.cursor/mcp.json`, the same entry without `"type"`. Clients that only support the older SSE transport should use `http://localhost:3001/mcp/sse`. If `MCP_API_KEY` is unset, leave out `headers`.
+**Cursor**: use `.cursor/mcp.json`, the same entry without `"type"`. Clients that only support the older SSE transport should use `http://localhost:3001/mcp/sse`. Set `SHIPMD_MCP_TOKEN` in the backend environment; requests without a matching `Authorization: Bearer <SHIPMD_MCP_TOKEN>` header receive `401 Unauthorized`.
 
 | Tool | Input | Effect |
 |---|---|---|
+| `list_tasks` | `assignee?`, `status?` (`todo`/`in_progress`/`review`/`done`), `limit?` | Filters tasks and returns them sorted by `priority` descending (highest priority first), then board position. |
+| `get_task_details` | `task_id` | Returns full task fields (`status`, `priority`, `pr_url`, `assignee`), Markdown description, parsed checklist `substeps`, and `comments`. |
+| `update_task_status` | `task_id`, `status`, `assignee?`, `pr_url?` | Updates status (`todo`, `in_progress`, `review`, `done`, …), optional assignee / PR URL, syncs the board column, and notifies Telegram on `done`. |
+| `add_task_comment` | `task_id`, `comment`, `author?` (`agent`) | Records a structured comment (progress note, error report, or PR link) and appends it to the card live. |
 | `get_board` | `column?` | Columns and cards. Without a filter, Done is capped at 10. |
-| `create_card` | `title`, `description?`, `column?` (Backlog), `tag?` (build), `assignee?` (agent) | Creates a card and broadcasts `CARD_CREATED` |
+| `create_card` | `title`, `description?`, `column?` (Backlog), `tag?` (build), `assignee?` (agent), `priority?` (0) | Creates a card and broadcasts `CARD_CREATED`. |
 | `move_card` | `card_id`, `target_column` | Moves the card and broadcasts `CARD_MOVED`. Moving to Done also notifies Telegram. |
 | `update_card_notes` | `card_id`, `note`, `append?` (true) | Appends a timestamped note, or replaces the description when `append` is false. Broadcasts `CARD_UPDATED`. |
 | `pick_next_agent_task` | — | Returns the agent's card that is already in Build. Otherwise it moves the top agent card in Backlog to Build and notifies Telegram. |
 
-The intended loop is: `pick_next_agent_task` → work → `update_card_notes` (commit, PR link) → `move_card` to Done.
+The intended loop is: `list_tasks` (or `pick_next_agent_task`) → `get_task_details` → `update_task_status` (`in_progress`) → work → `add_task_comment` (commit, PR link) → `update_task_status` (`review` or `done`, with `pr_url`).
 
 Quick check with curl:
 
 ```bash
-curl -s localhost:3001/mcp -H 'Content-Type: application/json' -H "Authorization: Bearer $MCP_API_KEY" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"pick_next_agent_task","arguments":{}}}'
+curl -s localhost:3001/mcp -H 'Content-Type: application/json' -H "Authorization: Bearer $SHIPMD_MCP_TOKEN" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_tasks","arguments":{"status":"todo"}}}'
 ```
 
 ## API reference
@@ -165,7 +169,7 @@ curl -s localhost:3001/mcp -H 'Content-Type: application/json' -H "Authorization
 
 - **WebSocket event types:** `CARD_CREATED`, `CARD_MOVED`, `CARD_UPDATED`, `CARD_DELETED`. The server also sends `HELLO` on connect and `RESYNC` when a client falls behind and should reload the board.
 - **`origin`:** the browser tab's `X-Client-Id`, or `"telegram"` / `"mcp"` for changes from those sources.
-- **Allowed values:** columns are `backlog`, `build`, `sell`, `done`. Tags are `build`, `sell`, `ops`. Assignees are `human`, `agent`.
+- **Allowed values:** columns are `backlog`, `build`, `sell`, `done`. Tags are `build`, `sell`, `ops`. Assignees accept `"human"`, `"agent"`, or specific agent names such as `"antigravity"` and `"hermes"`. Statuses are `todo`, `in_progress`, `review`, `sell`, `done`.
 - **Errors:** returned as `{ "error": "…" }` with status 400, 404 or 422.
 
 ## Project layout
@@ -178,8 +182,8 @@ backend/src/
   routes.rs     Thin REST handlers over service
   ws.rs         /ws: forwards broadcast events, heartbeat, RESYNC on lag
   telegram.rs   Bot: long polling, commands, inline buttons, notifications
-  mcp.rs        MCP server: JSON-RPC, both transports, auth guard, 5 tools
-  db.rs         Schema, WAL setup, seed data, column list
+  mcp.rs        MCP server: JSON-RPC, both transports, SHIPMD_MCP_TOKEN bearer auth, 9 tools
+  db.rs         Schema, WAL setup, idempotent migrations, seed data, column list
   models.rs     Card / Column / request types
   error.rs      AppError → JSON HTTP errors
 frontend/src/
@@ -203,7 +207,7 @@ The root `Dockerfile` builds a single image: the frontend is built, and the Rust
 
 ```bash
 fly launch --copy-config --no-deploy          # or the Fly web launcher; uses fly.toml (app "shipmd", region ams)
-fly secrets set BOARD_PASSWORD='…' MCP_API_KEY='…'
+fly secrets set BOARD_PASSWORD='…' SHIPMD_MCP_TOKEN='…'
 fly secrets set TELEGRAM_BOT_TOKEN='…' TELEGRAM_ALLOWED_CHAT_ID='…'   # optional
 fly deploy
 fly scale count 1                              # make sure exactly one machine runs
@@ -217,12 +221,12 @@ With a password set, scripts authenticate with Basic auth:
 curl -u ":$BOARD_PASSWORD" https://<app>.fly.dev/api/board
 ```
 
-MCP clients keep using `Authorization: Bearer $MCP_API_KEY` on `https://<app>.fly.dev/mcp`.
+MCP clients keep using `Authorization: Bearer $SHIPMD_MCP_TOKEN` on `https://<app>.fly.dev/mcp`.
 
 ### Checklist before going public
 
 1. **Set `BOARD_PASSWORD`.** Without it, anyone with the URL can read and change the board.
-2. **Set `MCP_API_KEY`.** If the key is unset, MCP trusts loopback connections. Behind a reverse proxy on the same host (Caddy, nginx), every request looks like loopback, so anyone could connect.
+2. **Set `SHIPMD_MCP_TOKEN`.** Without it, `/mcp` rejects all requests with `401 Unauthorized`.
 3. **Set `TELEGRAM_ALLOWED_CHAT_ID`.** Otherwise anyone who finds the bot can change your board.
 4. **Run exactly one instance.** WebSocket events live in the process's memory, and Telegram allows only one bot polling at a time. The SQLite file needs a persistent disk.
 
@@ -234,4 +238,4 @@ Other hosts work too: a small VPS (run the image with a volume), or Render on a 
 - Positions are floats, and dropping between two cards uses their midpoint. After thousands of reorders in the same spot, precision runs out. There's no rebalancing yet.
 - `pick_next_agent_task` doesn't claim cards atomically. Two agents calling it at the same moment can get the same card.
 - `start` from `/api/agent/action` sends sell-tagged cards to Sell, but `pick_next_agent_task` always moves cards to Build.
-- No schema migrations. The schema is created with `CREATE TABLE IF NOT EXISTS` in `db.rs`.
+- `db::migrate()` runs idempotently at startup to add `status`, `priority`, `pr_url`, and `card_comments` to existing `board.db` files, while relaxing the `assignee` constraint.

@@ -8,8 +8,8 @@
 
   ```json
   { "mcpServers": { "ship-board": { "type": "http", "url": "http://localhost:3001/mcp",
-      "headers": { "Authorization": "Bearer ${MCP_API_KEY}" } } } }
+      "headers": { "Authorization": "Bearer ${SHIPMD_MCP_TOKEN}" } } } }
   ```
 
-  Without `MCP_API_KEY`, drop `headers`; the server then accepts localhost only.
+  `SHIPMD_MCP_TOKEN` must be set on the server; requests without a matching Bearer token receive `401 Unauthorized`.
 - Never commit `backend/.env`, `*.db` files or tokens. `.gitignore` already covers them.

@@ -35,8 +35,8 @@ Run locally with `cd backend && cargo run` (port 3001) and `cd frontend && npm r
 | `backend/src/telegram.rs` | Bot: `Telegram` handle, `run()` polling loop, command and callback handlers, `notify_*` helpers, rendering. |
 | `backend/src/mcp.rs` | MCP: `router()`, auth middleware, Streamable HTTP and SSE transports, JSON-RPC dispatch, `tool_definitions()`, tool functions. |
 | `backend/src/ws.rs` | Forwards broadcast strings to sockets, heartbeat ping, sends `RESYNC` when a client lags. |
-| `backend/src/db.rs` | Pool and WAL options, schema (`CREATE TABLE IF NOT EXISTS`), seed data, `COLUMNS`. |
-| `backend/src/models.rs` | Row types (`Card`, `Column`) and request types (`CreateCard`, `PatchCard`, `AgentAction`, `Tag`, `Assignee`). |
+| `backend/src/db.rs` | Pool and WAL options, schema (`CREATE TABLE IF NOT EXISTS`), idempotent `migrate()` for `board.db`, seed data, `COLUMNS`. |
+| `backend/src/models.rs` | Row types (`Card`, `CardComment`, `Column`) and request types (`CreateCard`, `PatchCard`, `AgentAction`, `Tag`, `Assignee`). |
 | `backend/src/main.rs` | `AppState`, `emit()`, `now()`, router wiring, static frontend (`STATIC_DIR`), Telegram spawn. |
 | `backend/src/auth.rs` | Optional `BOARD_PASSWORD` guard: Basic auth, then an HttpOnly session cookie. Also `constant_time_eq`, which MCP reuses. |
 | `Dockerfile`, `fly.toml` | Single image (frontend build + Rust binary) and Fly.io config: one always-on machine, volume at `/data`. |
@@ -61,17 +61,19 @@ Run locally with `cd backend && cargo run` (port 3001) and `cd frontend && npm r
 4. **Columns are fixed:** `backlog`, `build`, `sell`, `done`. `db::COLUMNS` is the source of truth, and `service::DONE_COLUMN` names Done. The frontend treats the *last* column as Done for the ratio bar.
 5. **Positions** are `f64` with a gap of 1024. Inserting between two cards uses their midpoint. When no position is given, new cards go to the end, but moves into Done go to the top (Done is newest first).
 6. **Queries are checked at runtime, not compile time.** Use `sqlx::query` / `query_as::<_, T>` and `#[derive(FromRow)]`. Don't use `query!` macros: the build must not need `DATABASE_URL`.
-7. **Schema changes:** there is no migration system. `CREATE TABLE IF NOT EXISTS` won't change existing `board.db` files. If you change the schema, add an explicit, idempotent migration step in `db.rs` and say so in your summary.
+7. **Schema changes:** `db::migrate()` runs idempotently at startup after `CREATE TABLE IF NOT EXISTS` to upgrade existing `board.db` files safely (it already relaxed the `assignee` check to allow arbitrary agent names like `"antigravity"` / `"hermes"`, and added `status`, `priority`, `pr_url`, and `card_comments`). Any future schema change must also add an explicit, idempotent migration step in `db::migrate()` and be noted in your summary.
 8. **Keep Telegram replies tidy.**
    - Inline-button `callback_data` must be ≤ 64 bytes. A test enforces this for the UUID-based formats.
    - Escape all user text with `telegram::esc` (messages use `parse_mode: HTML`).
    - Prefer editing the existing message over sending a new one.
 9. **Never log secrets.** `TgError` strips request URLs because they contain the bot token. Keep it that way.
 10. **MCP:**
+    - Auth uses `SHIPMD_MCP_TOKEN` (`Authorization: Bearer <SHIPMD_MCP_TOKEN>`, with `MCP_API_KEY` as a deprecated fallback). If unset, `/mcp` logs a warning at startup and rejects all requests with `401 Unauthorized`.
+    - Supports `initialize`, `notifications/initialized`, `tools/list`, and `tools/call` over `POST /mcp` (Streamable HTTP) as well as legacy SSE (`/mcp/sse`, `/mcp/messages`).
     - A tool failure returns a normal result with `isError: true`, so the model can read it and retry. Use JSON-RPC errors only for protocol problems such as an unknown method or tool.
-    - Inputs accept column titles or ids case-insensitively, and full or 8-char short card ids.
-    - If you add or change a tool, update `tool_definitions()` (strict JSON Schema, `additionalProperties: false`), the `tool_schemas_are_objects` test count, and the README tool table.
-11. **Router wiring:** board routes (`/api/*`, `/ws`, the static fallback) are one router wrapped in `auth::require`. `/healthz` stays outside it and must remain public for Fly health checks. `mcp::router()` brings its own state and auth, and is `.merge()`d after `.with_state(state)`. CORS goes last. The server must be started with `into_make_service_with_connect_info::<SocketAddr>()`, because the MCP auth guard reads the peer address. A new board route must sit inside the guarded router.
+    - Inputs accept column titles or ids case-insensitively, status values (`todo`, `in_progress`, `review`, `done`, or column names), and full or >=4-char short card ids.
+    - If you add or change a tool, update `tool_definitions()` (strict JSON Schema, `additionalProperties: false`), the `tool_schemas_are_objects` test count (currently 9), and the README tool table.
+11. **Router wiring:** board routes (`/api/*`, `/ws`, the static fallback) are one router wrapped in `auth::require`. `/healthz` stays outside it and must remain public for Fly health checks. `mcp::router()` brings its own state and bearer auth (`SHIPMD_MCP_TOKEN`), and is `.merge()`d after `.with_state(state)`. CORS goes last. A new board route must sit inside the guarded router.
 12. **Single instance.** Don't add anything that assumes more than one backend process: the broadcast channel is in memory, and Telegram's `getUpdates` allows only one poller.
 
 ### Frontend
@@ -96,7 +98,7 @@ Run locally with `cd backend && cargo run` (port 3001) and `cd frontend && npm r
 
 ## Using the board yourself (MCP)
 
-If this repo's board is running and connected as an MCP server, work this way: `pick_next_agent_task` → implement → `update_card_notes` (commit hash, PR link, short summary) → `move_card` to `Done`. Never move a card to Done unless the checks above pass.
+If this repo's board is running and connected as an MCP server, work this way: `list_tasks` (or `pick_next_agent_task`) → `get_task_details` → `update_task_status` (`in_progress`) → implement → `add_task_comment` (commit hash, PR link, short summary) → `update_task_status` (`review` or `done`, with `pr_url`). Never move a card to `done` unless the checks above pass.
 
 ## Known gaps
 

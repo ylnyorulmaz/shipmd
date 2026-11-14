@@ -7,20 +7,19 @@
 //! Tools reuse `crate::service` (SQLite + WebSocket broadcast) and `crate::telegram` notifications,
 //! so an agent's change animates on the web board and pings Telegram like any other change.
 //!
-//! Auth: `MCP_API_KEY` set ⇒ `Authorization: Bearer <key>` required. Unset ⇒ loopback-only, and
-//! browser requests from non-localhost origins are rejected (DNS-rebinding guard).
+//! Auth: `SHIPMD_MCP_TOKEN` (or fallback `MCP_API_KEY`) sets the required `Authorization: Bearer <token>`.
+//! When unset, a warning is logged and all requests to `/mcp` are rejected with `401 Unauthorized`.
 
 use std::{
     collections::HashMap,
     convert::Infallible,
-    net::SocketAddr,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
 use axum::{
     body::Bytes,
-    extract::{ConnectInfo, Query, Request, State},
+    extract::{Query, Request, State},
     http::{header, StatusCode},
     middleware::{self, Next},
     response::{
@@ -38,7 +37,7 @@ use tokio::sync::mpsc;
 use crate::{
     db::COLUMNS,
     error::AppError,
-    models::{AgentAction, AgentVerb, Assignee, Card, CreateCard, PatchCard, Tag},
+    models::{AgentAction, AgentVerb, Card, CreateCard, PatchCard, Tag},
     service::{self, DONE_COLUMN},
     telegram, AppState,
 };
@@ -47,10 +46,13 @@ const ORIGIN: &str = "mcp";
 const SUPPORTED_VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
 /// Done cards returned by get_board without a column filter (newest first).
 const DONE_LIMIT: usize = 10;
+const DEFAULT_LIST_LIMIT: usize = 50;
+const MAX_LIST_LIMIT: usize = 200;
 
 const INSTRUCTIONS: &str = "Ship Board is the Kanban board you share with a solo founder (columns: Backlog, Build, Sell, Done). \
-Workflow: call pick_next_agent_task to claim work, log progress / commit hashes / PR links with update_card_notes, \
-and move_card to Done when finished. Every change appears live on the founder's board and phone.";
+Workflow: call list_tasks or pick_next_agent_task to claim work, inspect full details with get_task_details, \
+log progress / commit hashes / PR links with add_task_comment or update_card_notes, and call update_task_status \
+(in_progress, review, done) as you progress. Every change appears live on the founder's board and phone.";
 
 // ---------------------------------------------------------------------------
 // Router & state
@@ -65,18 +67,39 @@ struct McpCtx {
     sessions: Sessions,
 }
 
-/// Router with its own state, ready to `.merge()` into the main app.
-/// Requires serving with `into_make_service_with_connect_info::<SocketAddr>()`.
-pub fn router(app: AppState) -> Router {
-    let api_key = std::env::var("MCP_API_KEY")
+fn non_empty_env(name: &str) -> Option<String> {
+    std::env::var(name)
         .ok()
         .map(|k| k.trim().to_string())
         .filter(|k| !k.is_empty())
-        .map(Arc::from);
-    match &api_key {
-        Some(_) => tracing::info!("MCP server on /mcp (bearer auth enabled)"),
-        None => tracing::warn!("MCP_API_KEY not set — MCP server on /mcp accepts unauthenticated localhost requests only"),
-    }
+}
+
+/// Router with its own state, ready to `.merge()` into the main app.
+pub fn router(app: AppState) -> Router {
+    let api_key = match non_empty_env("SHIPMD_MCP_TOKEN") {
+        Some(token) => {
+            tracing::info!("MCP server on /mcp (bearer auth enabled via SHIPMD_MCP_TOKEN)");
+            Some(Arc::from(token))
+        }
+        None => match non_empty_env("MCP_API_KEY") {
+            Some(token) => {
+                tracing::warn!(
+                    "MCP server using legacy MCP_API_KEY — please migrate to SHIPMD_MCP_TOKEN"
+                );
+                Some(Arc::from(token))
+            }
+            None => {
+                tracing::warn!(
+                    "SHIPMD_MCP_TOKEN is not set — /mcp will reject all unauthorized requests with 401 Unauthorized"
+                );
+                None
+            }
+        },
+    };
+    router_with_token(app, api_key)
+}
+
+fn router_with_token(app: AppState, api_key: Option<Arc<str>>) -> Router {
     let ctx = McpCtx { app, api_key, sessions: Arc::default() };
 
     Router::new()
@@ -91,48 +114,28 @@ pub fn router(app: AppState) -> Router {
 // Auth guard
 // ---------------------------------------------------------------------------
 
-fn is_local_origin(origin: &str) -> bool {
-    let host = origin.split("://").nth(1).unwrap_or(origin);
-    let host = host.split('/').next().unwrap_or(host);
-    let host = host.rsplit_once(':').map_or(host, |(h, port)| if port.chars().all(|c| c.is_ascii_digit()) { h } else { host });
-    matches!(host, "localhost" | "127.0.0.1" | "[::1]")
+fn unauthorized(msg: &str) -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        [(header::WWW_AUTHENTICATE, "Bearer")],
+        Json(json!({ "error": msg })),
+    )
+        .into_response()
 }
 
-async fn auth(
-    State(ctx): State<McpCtx>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    req: Request,
-    next: Next,
-) -> Response {
-    let headers = req.headers();
-    if let Some(key) = &ctx.api_key {
-        let presented = headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .map(str::trim)
-            .unwrap_or_default();
-        if !crate::auth::constant_time_eq(presented.as_bytes(), key.as_bytes()) {
-            return (
-                StatusCode::UNAUTHORIZED,
-                [(header::WWW_AUTHENTICATE, "Bearer")],
-                Json(json!({ "error": "missing or invalid MCP bearer token" })),
-            )
-                .into_response();
-        }
-    } else {
-        if !peer.ip().to_canonical().is_loopback() {
-            return (
-                StatusCode::FORBIDDEN,
-                Json(json!({ "error": "MCP_API_KEY is not set: only localhost may use /mcp" })),
-            )
-                .into_response();
-        }
-        if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
-            if !is_local_origin(origin) {
-                return (StatusCode::FORBIDDEN, Json(json!({ "error": "origin not allowed" }))).into_response();
-            }
-        }
+async fn auth(State(ctx): State<McpCtx>, req: Request, next: Next) -> Response {
+    let Some(key) = &ctx.api_key else {
+        return unauthorized("SHIPMD_MCP_TOKEN is not configured on the server");
+    };
+    let presented = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim)
+        .unwrap_or_default();
+    if !crate::auth::constant_time_eq(presented.as_bytes(), key.as_bytes()) {
+        return unauthorized("missing or invalid MCP bearer token");
     }
     next.run(req).await
 }
@@ -272,6 +275,7 @@ async fn handle_message(ctx: &McpCtx, msg: Value) -> Option<Value> {
                 }),
             )
         }
+        "notifications/initialized" => rpc_result(&id, json!({})),
         "ping" => rpc_result(&id, json!({})),
         "tools/list" => rpc_result(&id, json!({ "tools": tool_definitions() })),
         "tools/call" => {
@@ -299,17 +303,88 @@ async fn handle_message(ctx: &McpCtx, msg: Value) -> Option<Value> {
 
 fn tool_definitions() -> Value {
     let column_enum = json!(["Backlog", "Build", "Sell", "Done"]);
+    let status_enum = json!(["todo", "in_progress", "review", "done", "backlog", "build", "sell"]);
     let card_id = json!({
         "type": "string",
         "description": "Card id: the full UUID or its first 8 characters (the short id shown on the board, e.g. \"fc4d52cc\")."
     });
+    let task_id = json!({
+        "type": "string",
+        "description": "Task id: the full UUID or a unique prefix of at least 4 hex characters (e.g. the 8-char short id)."
+    });
     json!([
+        {
+            "name": "list_tasks",
+            "title": "List tasks",
+            "description": "List tasks filtered by optional assignee (e.g. \"antigravity\", \"hermes\", \"human\", \"agent\") \
+and/or status (todo, in_progress, review, done, or column names backlog, build, sell). \
+Matching tasks are returned sorted by priority descending (highest priority first), then board position.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "assignee": { "type": "string", "description": "Filter by assignee (e.g. \"antigravity\", \"hermes\", \"human\", \"agent\"). Case-insensitive." },
+                    "status": { "type": "string", "enum": status_enum, "description": "Filter by status (todo, in_progress, review, done, backlog, build, sell)." },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": MAX_LIST_LIMIT, "default": DEFAULT_LIST_LIMIT, "description": "Maximum number of tasks to return." }
+                },
+                "additionalProperties": false
+            },
+            "annotations": { "readOnlyHint": true, "openWorldHint": false }
+        },
+        {
+            "name": "get_task_details",
+            "title": "Get task details",
+            "description": "Fetch full details for a task by task_id: full Markdown description, parsed checklist substeps, comments, current status, assignee, priority, and pr_url.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task_id": task_id
+                },
+                "required": ["task_id"],
+                "additionalProperties": false
+            },
+            "annotations": { "readOnlyHint": true, "openWorldHint": false }
+        },
+        {
+            "name": "update_task_status",
+            "title": "Update task status",
+            "description": "Update a task's status (e.g. todo, in_progress, review, done) and optionally reassign it or attach a PR URL. \
+Moves the card to the matching board column and broadcasts the change live; moving to done also notifies Telegram.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task_id": task_id,
+                    "status": { "type": "string", "enum": status_enum, "description": "Target status (e.g. todo, in_progress, review, done)." },
+                    "assignee": { "type": "string", "minLength": 1, "maxLength": 64, "description": "Optional new assignee (e.g. \"antigravity\", \"hermes\", \"human\", \"agent\")." },
+                    "pr_url": { "type": "string", "maxLength": 2048, "description": "Optional pull request URL associated with the task." }
+                },
+                "required": ["task_id", "status"],
+                "additionalProperties": false
+            },
+            "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false }
+        },
+        {
+            "name": "add_task_comment",
+            "title": "Add task comment",
+            "description": "Add a progress note, error report, or PR link comment to a task with author attribution. \
+Stored in task comments and reflected live on the board.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "task_id": task_id,
+                    "comment": { "type": "string", "minLength": 1, "description": "Comment body (progress note, error report, or PR link)." },
+                    "author": { "type": "string", "minLength": 1, "maxLength": 64, "default": "agent", "description": "Author name (e.g. \"hermes\", \"antigravity\", \"human\")." }
+                },
+                "required": ["task_id", "comment"],
+                "additionalProperties": false
+            },
+            "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false }
+        },
         {
             "name": "get_board",
             "title": "Get board",
             "description": "Fetch the current Kanban board: columns Backlog, Build, Sell, Done (in that order) with their cards. \
-Each card has id, short_id, title, tag (build|sell|ops), assignee (human|agent), Markdown description and updated_at. \
-Cards are in priority order (top first). Without a filter, Done is limited to the 10 most recent cards.",
+Each card has id, short_id, title, tag (build|sell|ops), assignee, status, priority, pr_url, Markdown description and updated_at. \
+Cards are in board position order (top first). Without a filter, Done is limited to the 10 most recent cards.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -330,7 +405,8 @@ Cards are in priority order (top first). Without a filter, Done is limited to th
                     "description": { "type": "string", "description": "Optional Markdown details (acceptance criteria, links, checklists)." },
                     "column": { "type": "string", "enum": column_enum, "default": "Backlog", "description": "Column to create the card in." },
                     "tag": { "type": "string", "enum": ["build", "sell", "ops"], "default": "build", "description": "build = product/engineering, sell = marketing/sales, ops = operations." },
-                    "assignee": { "type": "string", "enum": ["human", "agent"], "default": "agent", "description": "Who should do it: the AI agent or the human founder." }
+                    "assignee": { "type": "string", "minLength": 1, "maxLength": 64, "default": "agent", "description": "Who should do it (e.g. \"agent\", \"antigravity\", \"hermes\", \"human\")." },
+                    "priority": { "type": "integer", "default": 0, "description": "Optional integer priority (higher values sort first in list_tasks)." }
                 },
                 "required": ["title"],
                 "additionalProperties": false
@@ -398,6 +474,10 @@ type ToolResult = Result<Value, String>;
 
 async fn call_tool(app: &AppState, name: &str, args: &Value) -> ToolOutcome {
     let result = match name {
+        "list_tasks" => list_tasks(app, args).await,
+        "get_task_details" => get_task_details(app, args).await,
+        "update_task_status" => update_task_status(app, args).await,
+        "add_task_comment" => add_task_comment(app, args).await,
         "get_board" => get_board(app, args).await,
         "create_card" => create_card(app, args).await,
         "move_card" => move_card(app, args).await,
@@ -423,13 +503,23 @@ fn str_arg<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     args.get(key).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())
 }
 
-/// Card ids may arrive as strings or (from sloppy clients) numbers.
-fn card_id_arg(args: &Value) -> Result<String, String> {
-    match args.get("card_id") {
+/// Accepts `key` (or optional fallback key) as string or number.
+fn id_arg(args: &Value, primary: &str, fallback: Option<&str>) -> Result<String, String> {
+    let val = args.get(primary).or_else(|| fallback.and_then(|k| args.get(k)));
+    match val {
         Some(Value::String(s)) if !s.trim().is_empty() => Ok(s.trim().to_string()),
         Some(Value::Number(n)) => Ok(n.to_string()),
-        _ => Err("card_id is required (full UUID or 8-char short id)".into()),
+        _ => Err(format!("{primary} is required (full UUID or unique prefix)")),
     }
+}
+
+/// Card ids may arrive as strings or (from sloppy clients) numbers.
+fn card_id_arg(args: &Value) -> Result<String, String> {
+    id_arg(args, "card_id", Some("task_id"))
+}
+
+fn task_id_arg(args: &Value) -> Result<String, String> {
+    id_arg(args, "task_id", Some("card_id"))
 }
 
 /// Accepts a column title or id, case-insensitively ("Backlog", "backlog").
@@ -450,18 +540,129 @@ fn card_json(card: &Card) -> Value {
         "id": card.id,
         "short_id": &card.id[..8.min(card.id.len())],
         "column": column_title(&card.column_id),
+        "column_id": card.column_id,
+        "status": card.status,
         "title": card.title,
         "tag": card.tag,
         "assignee": card.assignee,
+        "priority": card.priority,
+        "pr_url": card.pr_url,
         "description": card.description,
+        "position": card.position,
         "updated_at": card.updated_at,
     })
+}
+
+fn parse_substeps(description: Option<&str>) -> Vec<Value> {
+    let Some(desc) = description else {
+        return Vec::new();
+    };
+    desc.lines()
+        .filter_map(|line| {
+            let trimmed = line.trim_start();
+            let (done, text) = trimmed
+                .strip_prefix("- [ ] ")
+                .or_else(|| trimmed.strip_prefix("* [ ] "))
+                .map(|t| (false, t))
+                .or_else(|| {
+                    trimmed
+                        .strip_prefix("- [x] ")
+                        .or_else(|| trimmed.strip_prefix("- [X] "))
+                        .or_else(|| trimmed.strip_prefix("* [x] "))
+                        .or_else(|| trimmed.strip_prefix("* [X] "))
+                        .map(|t| (true, t))
+                })?;
+            Some(json!({ "text": text.trim(), "done": done }))
+        })
+        .collect()
 }
 
 fn notify(app: &AppState, text: String, card: &Card) {
     if let Some(bot) = app.telegram.clone() {
         tokio::spawn(telegram::notify_card(bot, text, card.clone()));
     }
+}
+
+async fn list_tasks(app: &AppState, args: &Value) -> ToolResult {
+    let assignee = str_arg(args, "assignee");
+    let status = str_arg(args, "status");
+    let limit = match args.get("limit") {
+        None | Some(Value::Null) => DEFAULT_LIST_LIMIT,
+        Some(v) => {
+            let n = v.as_i64().ok_or("limit must be an integer")?;
+            if !(1..=MAX_LIST_LIMIT as i64).contains(&n) {
+                return Err(format!("limit must be between 1 and {MAX_LIST_LIMIT}"));
+            }
+            n as usize
+        }
+    };
+
+    let tasks = service::list_tasks(app, assignee, status, limit)
+        .await
+        .map_err(app_err)?;
+    Ok(json!({
+        "count": tasks.len(),
+        "tasks": tasks.iter().map(card_json).collect::<Vec<_>>(),
+    }))
+}
+
+async fn get_task_details(app: &AppState, args: &Value) -> ToolResult {
+    let key = task_id_arg(args)?;
+    let card = service::resolve_card(app, &key).await.map_err(app_err)?;
+    let comments = service::list_comments(app, &card.id).await.map_err(app_err)?;
+    let substeps = parse_substeps(card.description.as_deref());
+    Ok(json!({
+        "task": card_json(&card),
+        "substeps": substeps,
+        "comments": comments,
+    }))
+}
+
+async fn update_task_status(app: &AppState, args: &Value) -> ToolResult {
+    let key = task_id_arg(args)?;
+    let status = str_arg(args, "status").ok_or("status is required")?;
+    let assignee = str_arg(args, "assignee").map(str::to_string);
+    let pr_url = args.get("pr_url").and_then(Value::as_str).map(str::to_string);
+
+    let before = service::resolve_card(app, &key).await.map_err(app_err)?;
+    let patch = PatchCard {
+        status: Some(status.to_string()),
+        assignee,
+        pr_url,
+        ..Default::default()
+    };
+    let card = service::update_card(app, &before.id, patch, Some(ORIGIN.into()))
+        .await
+        .map_err(app_err)?;
+
+    if card.column_id == DONE_COLUMN && before.column_id != DONE_COLUMN {
+        notify(
+            app,
+            format!("🤖 MCP Agent moved \"<b>{}</b>\" to Done", telegram::esc(&card.title)),
+            &card,
+        );
+    }
+
+    Ok(json!({
+        "previous_status": before.status,
+        "moved_from": column_title(&before.column_id),
+        "task": card_json(&card),
+    }))
+}
+
+async fn add_task_comment(app: &AppState, args: &Value) -> ToolResult {
+    let key = task_id_arg(args)?;
+    let comment = str_arg(args, "comment").ok_or("comment is required")?;
+    let author = str_arg(args, "author");
+
+    let (card, comment_row) = service::add_card_comment(app, &key, author, comment, Some(ORIGIN.into()))
+        .await
+        .map_err(app_err)?;
+
+    Ok(json!({
+        "comment": comment_row,
+        "task": card_json(&card),
+    }))
 }
 
 async fn get_board(app: &AppState, args: &Value) -> ToolResult {
@@ -492,10 +693,10 @@ async fn create_card(app: &AppState, args: &Value) -> ToolResult {
         Some("ops") => Tag::Ops,
         Some(other) => return Err(format!("invalid tag '{other}' — use build, sell or ops")),
     };
-    let assignee = match str_arg(args, "assignee").map(str::to_ascii_lowercase).as_deref() {
-        None | Some("agent") => Assignee::Agent,
-        Some("human") => Assignee::Human,
-        Some(other) => return Err(format!("invalid assignee '{other}' — use human or agent")),
+    let assignee = str_arg(args, "assignee").unwrap_or("agent").to_string();
+    let priority = match args.get("priority") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(v.as_i64().ok_or("priority must be an integer")?),
     };
     let card = service::create_card(
         app,
@@ -506,6 +707,9 @@ async fn create_card(app: &AppState, args: &Value) -> ToolResult {
             description: str_arg(args, "description").map(Into::into),
             tag: Some(tag),
             assignee: Some(assignee),
+            status: None,
+            priority,
+            pr_url: None,
             position: None,
         },
         Some(ORIGIN.into()),
@@ -555,7 +759,7 @@ async fn pick_next_agent_task(app: &AppState) -> ToolResult {
             .columns
             .iter()
             .find(|c| c.column.id == col)
-            .and_then(|c| c.cards.iter().find(|card| card.assignee == "agent"))
+            .and_then(|c| c.cards.iter().find(|card| card.assignee != "human"))
             .cloned()
     };
 
@@ -564,7 +768,7 @@ async fn pick_next_agent_task(app: &AppState) -> ToolResult {
             "status": "resumed",
             "message": "You already have this task in progress in Build — finish it first.",
             "task": card_json(&card),
-            "next_steps": "Record progress with update_card_notes, then move_card to Done.",
+            "next_steps": "Record progress with add_task_comment or update_card_notes, then update_task_status to done.",
         }));
     }
     let Some(card) = next_in("backlog") else {
@@ -578,13 +782,58 @@ async fn pick_next_agent_task(app: &AppState) -> ToolResult {
         "status": "started",
         "message": "Moved from Backlog to Build. This task is yours now.",
         "task": card_json(&card),
-        "next_steps": "Record progress with update_card_notes, then move_card to Done.",
+        "next_steps": "Record progress with add_task_comment or update_card_notes, then update_task_status to done.",
     }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
+    use tokio::sync::broadcast;
+    use tower::ServiceExt;
+
+    async fn test_app() -> (AppState, String) {
+        let path = format!("/tmp/shipmd_mcp_test_{}.db", uuid::Uuid::new_v4());
+        let pool = crate::db::connect(&path).await.unwrap();
+        let (events, _) = broadcast::channel(64);
+        let state = AppState {
+            pool,
+            events,
+            board_title: "Ship Board Test".into(),
+            telegram: None,
+        };
+        (state, path)
+    }
+
+    fn cleanup_db(path: &str) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(format!("{path}-wal"));
+        let _ = std::fs::remove_file(format!("{path}-shm"));
+    }
+
+    async fn post_mcp(app: &Router, auth_header: Option<&str>, payload: Value) -> (StatusCode, Value) {
+        let mut req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header(header::CONTENT_TYPE, "application/json");
+        if let Some(auth) = auth_header {
+            req = req.header(header::AUTHORIZATION, auth);
+        }
+        let resp = app
+            .clone()
+            .oneshot(req.body(Body::from(payload.to_string())).unwrap())
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap()
+        };
+        (status, body)
+    }
 
     #[test]
     fn columns_accept_titles_and_ids() {
@@ -595,21 +844,251 @@ mod tests {
     }
 
     #[test]
-    fn local_origins() {
-        assert!(is_local_origin("http://localhost:5173"));
-        assert!(is_local_origin("http://127.0.0.1"));
-        assert!(is_local_origin("http://[::1]:3001"));
-        assert!(!is_local_origin("https://evil.example"));
-        assert!(!is_local_origin("http://localhost.evil.example"));
-    }
-
-    #[test]
     fn tool_schemas_are_objects() {
         let tools = tool_definitions();
         let tools = tools.as_array().unwrap();
-        assert_eq!(tools.len(), 5);
+        assert_eq!(tools.len(), 9);
         for t in tools {
             assert_eq!(t["inputSchema"]["type"], "object", "{}", t["name"]);
+            assert_eq!(t["inputSchema"]["additionalProperties"], false, "{}", t["name"]);
         }
+    }
+
+    #[tokio::test]
+    async fn auth_rejects_unset_token_and_invalid_bearer_with_401() {
+        let (state, db_path) = test_app().await;
+
+        // 1. No token configured -> 401 Unauthorized
+        let unconfigured = router_with_token(state.clone(), None);
+        let (st, _) = post_mcp(
+            &unconfigured,
+            None,
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+
+        // 2. Token configured -> missing or wrong bearer -> 401; matching bearer -> 200
+        let guarded = router_with_token(state.clone(), Some(Arc::from("secret-shipmd-token")));
+        let (st_missing, _) = post_mcp(
+            &guarded,
+            None,
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+        )
+        .await;
+        assert_eq!(st_missing, StatusCode::UNAUTHORIZED);
+
+        let (st_wrong, _) = post_mcp(
+            &guarded,
+            Some("Bearer wrong-token"),
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+        )
+        .await;
+        assert_eq!(st_wrong, StatusCode::UNAUTHORIZED);
+
+        let (st_ok, body_ok) = post_mcp(
+            &guarded,
+            Some("Bearer secret-shipmd-token"),
+            json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+        )
+        .await;
+        assert_eq!(st_ok, StatusCode::OK);
+        assert_eq!(body_ok["result"]["tools"].as_array().unwrap().len(), 9);
+
+        state.pool.close().await;
+        cleanup_db(&db_path);
+    }
+
+    #[tokio::test]
+    async fn mcp_lifecycle_and_task_tools_end_to_end() {
+        let (state, db_path) = test_app().await;
+        let app = router_with_token(state.clone(), Some(Arc::from("tok-123")));
+        let auth = Some("Bearer tok-123");
+
+        // initialize
+        let (st, init) = post_mcp(
+            &app,
+            auth,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": { "protocolVersion": "2025-06-18", "clientInfo": { "name": "hermes" } }
+            }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(init["result"]["protocolVersion"], "2025-06-18");
+
+        // notifications/initialized (JSON-RPC notification -> 202 Accepted)
+        let (st, notif) = post_mcp(
+            &app,
+            auth,
+            json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::ACCEPTED);
+        assert_eq!(notif, Value::Null);
+
+        // Create two tasks with different priorities for hermes
+        let low = service::create_card(
+            &state,
+            CreateCard {
+                id: None,
+                column_id: "backlog".into(),
+                title: "Low priority task".into(),
+                description: Some("- [ ] step 1\n- [x] step 0".into()),
+                tag: Some(Tag::Build),
+                assignee: Some("hermes".into()),
+                status: None,
+                priority: Some(1),
+                pr_url: None,
+                position: None,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        let high = service::create_card(
+            &state,
+            CreateCard {
+                id: None,
+                column_id: "backlog".into(),
+                title: "High priority task".into(),
+                description: Some("- [ ] wire /mcp\n- [ ] run cargo test".into()),
+                tag: Some(Tag::Build),
+                assignee: Some("antigravity".into()),
+                status: None,
+                priority: Some(10),
+                pr_url: None,
+                position: None,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+
+        // list_tasks sorted by priority descending
+        let (st, list_res) = post_mcp(
+            &app,
+            auth,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "list_tasks",
+                    "arguments": { "status": "todo", "limit": 10 }
+                }
+            }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let parsed: Value = serde_json::from_str(list_res["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        let tasks = parsed["tasks"].as_array().unwrap();
+        assert_eq!(tasks[0]["id"], high.id);
+        assert_eq!(tasks[0]["priority"], 10);
+        assert_eq!(tasks[1]["id"], low.id);
+
+        // list_tasks filtered by assignee
+        let (_, hermes_res) = post_mcp(
+            &app,
+            auth,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "list_tasks",
+                    "arguments": { "assignee": "hermes" }
+                }
+            }),
+        )
+        .await;
+        let hermes_parsed: Value =
+            serde_json::from_str(hermes_res["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(hermes_parsed["count"], 1);
+        assert_eq!(hermes_parsed["tasks"][0]["id"], low.id);
+
+        // update_task_status -> review with assignee & pr_url
+        let (_, upd_res) = post_mcp(
+            &app,
+            auth,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "update_task_status",
+                    "arguments": {
+                        "task_id": &high.id[..8],
+                        "status": "review",
+                        "assignee": "hermes",
+                        "pr_url": "https://github.com/ylnyorulmaz/shipmd/pull/42"
+                    }
+                }
+            }),
+        )
+        .await;
+        let upd_parsed: Value =
+            serde_json::from_str(upd_res["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(upd_parsed["task"]["status"], "review");
+        assert_eq!(upd_parsed["task"]["column_id"], "build");
+        assert_eq!(upd_parsed["task"]["assignee"], "hermes");
+        assert_eq!(
+            upd_parsed["task"]["pr_url"],
+            "https://github.com/ylnyorulmaz/shipmd/pull/42"
+        );
+
+        // add_task_comment
+        let (_, cmt_res) = post_mcp(
+            &app,
+            auth,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "tools/call",
+                "params": {
+                    "name": "add_task_comment",
+                    "arguments": {
+                        "task_id": &high.id[..8],
+                        "author": "hermes",
+                        "comment": "Implemented /mcp and opened PR #42"
+                    }
+                }
+            }),
+        )
+        .await;
+        assert_eq!(cmt_res["result"]["isError"], false);
+
+        // get_task_details returns description, substeps, comments, and status
+        let (_, det_res) = post_mcp(
+            &app,
+            auth,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 6,
+                "method": "tools/call",
+                "params": {
+                    "name": "get_task_details",
+                    "arguments": { "task_id": high.id }
+                }
+            }),
+        )
+        .await;
+        let det_parsed: Value =
+            serde_json::from_str(det_res["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(det_parsed["task"]["status"], "review");
+        assert_eq!(det_parsed["substeps"].as_array().unwrap().len(), 2);
+        assert_eq!(det_parsed["comments"].as_array().unwrap().len(), 1);
+        assert_eq!(det_parsed["comments"][0]["author"], "hermes");
+        assert_eq!(
+            det_parsed["comments"][0]["comment"],
+            "Implemented /mcp and opened PR #42"
+        );
+
+        state.pool.close().await;
+        cleanup_db(&db_path);
     }
 }
