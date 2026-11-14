@@ -1,5 +1,8 @@
 export type Tag = 'build' | 'sell' | 'ops';
-export type Assignee = 'human' | 'agent';
+export type BuiltinAssignee = 'human' | 'antigravity' | 'hermes' | 'agent';
+export type Assignee = BuiltinAssignee | (string & {});
+
+export const ASSIGNEE_PRESETS: readonly BuiltinAssignee[] = ['human', 'antigravity', 'hermes', 'agent'];
 
 export interface Card {
   id: string;
@@ -8,6 +11,9 @@ export interface Card {
   description: string | null;
   tag: Tag;
   assignee: Assignee;
+  status?: string;
+  priority?: number;
+  pr_url?: string | null;
   position: number;
   updated_at: string;
 }

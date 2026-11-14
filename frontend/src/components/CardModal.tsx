@@ -1,9 +1,9 @@
 import { createEffect, createMemo, createSignal, For, on, onCleanup, onMount, Show } from 'solid-js';
 import { apiOrigin } from '../api';
 import { renderMarkdown } from '../markdown';
-import { board, deleteCard, setOpenCardId, toggleAssignee, updateCard } from '../store';
+import { board, deleteCard, setOpenCardId, updateCard } from '../store';
 import { TAGS } from '../types';
-import { AssigneeBadge, TAG_LABEL, TAG_SOLID } from '../ui';
+import { AssigneePicker, normalizeAssignee, TAG_LABEL, TAG_SOLID } from '../ui';
 
 function timeAgo(iso: string): string {
   const s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
@@ -137,7 +137,7 @@ export default function CardModal(props: { id: string }) {
           </p>
 
           {/* Meta row */}
-          <div class="mt-5 grid grid-cols-1 gap-4 sm:grid-cols-3">
+          <div class="mt-5 grid grid-cols-1 gap-4 sm:grid-cols-2">
             <div>
               <div class="mb-1.5 text-[11px] font-semibold tracking-wide text-slate-500 uppercase dark:text-zinc-500">Tag</div>
               <div class="flex gap-1">
@@ -159,10 +159,6 @@ export default function CardModal(props: { id: string }) {
               </div>
             </div>
             <div>
-              <div class="mb-1.5 text-[11px] font-semibold tracking-wide text-slate-500 uppercase dark:text-zinc-500">Assignee</div>
-              <AssigneeBadge size="md" assignee={card()!.assignee} onToggle={() => toggleAssignee(props.id)} />
-            </div>
-            <div>
               <div class="mb-1.5 text-[11px] font-semibold tracking-wide text-slate-500 uppercase dark:text-zinc-500">List</div>
               <select
                 value={card()!.column_id}
@@ -171,6 +167,19 @@ export default function CardModal(props: { id: string }) {
               >
                 <For each={board.columns}>{(c) => <option value={c.id}>{c.title}</option>}</For>
               </select>
+            </div>
+            <div class="sm:col-span-2">
+              <div class="mb-1.5 text-[11px] font-semibold tracking-wide text-slate-500 uppercase dark:text-zinc-500">Assignee</div>
+              <AssigneePicker
+                size="md"
+                value={card()!.assignee}
+                onChange={(next) => {
+                  const normalized = normalizeAssignee(next);
+                  if (normalized && normalized !== normalizeAssignee(card()!.assignee)) {
+                    void updateCard(props.id, { assignee: normalized });
+                  }
+                }}
+              />
             </div>
           </div>
 

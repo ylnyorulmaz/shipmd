@@ -1,6 +1,6 @@
 import { createMemo, For, Show } from 'solid-js';
 import { dropKeyFor, ghostHeight, isDropTarget } from '../dnd';
-import { composerColumn, setComposerColumn, sortedCardsIn } from '../store';
+import { assigneeFilter, composerColumn, setComposerColumn, sortedCardsIn, visibleCardsIn } from '../store';
 import type { Column } from '../types';
 import CardItem from './CardItem';
 import Composer from './Composer';
@@ -16,7 +16,8 @@ function Placeholder() {
 }
 
 export default function BoardColumn(props: { column: Column }) {
-  const cards = createMemo(() => sortedCardsIn(props.column.id));
+  const allCards = createMemo(() => sortedCardsIn(props.column.id));
+  const cards = createMemo(() => visibleCardsIn(props.column.id));
   const composing = () => composerColumn() === props.column.id;
 
   return (
@@ -26,7 +27,9 @@ export default function BoardColumn(props: { column: Column }) {
     >
       <header class="flex items-center justify-between px-3 pt-2.5 pb-1.5">
         <h2 class="text-[14px] font-semibold text-slate-800 dark:text-zinc-100">{props.column.title}</h2>
-        <span class="rounded-full px-1.5 text-xs font-medium text-slate-500 tabular-nums dark:text-zinc-500">{cards().length}</span>
+        <span class="rounded-full px-1.5 text-xs font-medium text-slate-500 tabular-nums dark:text-zinc-500">
+          {assigneeFilter() ? `${cards().length}/${allCards().length}` : cards().length}
+        </span>
       </header>
 
       <div data-list class="relative min-h-[8px] flex-1 overflow-y-auto px-2 pt-0.5 pb-0.5 [scrollbar-width:thin]">

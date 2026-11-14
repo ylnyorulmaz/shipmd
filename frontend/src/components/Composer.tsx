@@ -1,9 +1,19 @@
 import { createSignal, For, onMount } from 'solid-js';
 import { createCard, setComposerColumn } from '../store';
 import { TAGS, type Assignee, type Tag } from '../types';
-import { TAG_LABEL, TAG_SOLID } from '../ui';
+import { AssigneePicker, TAG_LABEL, TAG_SOLID } from '../ui';
 
-/** Inline Trello-style "add a card" composer. Supports `#build #sell #ops` and `@agent` tokens. */
+const MENTION_ALIASES: Record<string, Assignee> = {
+  me: 'human',
+  human: 'human',
+  antigravity: 'antigravity',
+  hermes: 'hermes',
+  agent: 'agent',
+  bot: 'agent',
+  ai: 'agent',
+};
+
+/** Inline Trello-style "add a card" composer. Supports `#build #sell #ops` and `@antigravity @hermes @agent` tokens. */
 export default function Composer(props: { columnId: string }) {
   let input!: HTMLTextAreaElement;
   const [tag, setTag] = createSignal<Tag>(props.columnId === 'sell' ? 'sell' : 'build');
@@ -19,7 +29,10 @@ export default function Composer(props: { columnId: string }) {
     let t = tag();
     let a = assignee();
     title = title.replace(/(^|\s)#(build|sell|ops)\b/gi, (_, sp, m: string) => ((t = m.toLowerCase() as Tag), sp));
-    title = title.replace(/(^|\s)@(agent|bot|ai)\b/gi, (_, sp) => ((a = 'agent'), sp));
+    title = title.replace(/(^|\s)@(me|human|antigravity|hermes|agent|bot|ai)\b/gi, (_, sp, m: string) => {
+      a = MENTION_ALIASES[m.toLowerCase()] ?? a;
+      return sp;
+    });
     title = title.replace(/\s+/g, ' ').trim();
     if (!title) return;
     void createCard({ column_id: props.columnId, title, tag: t, assignee: a });
@@ -33,7 +46,7 @@ export default function Composer(props: { columnId: string }) {
       <textarea
         ref={input}
         rows={2}
-        placeholder="Enter a title… (#sell, @agent)"
+        placeholder="Enter a title… (#sell, @antigravity, @hermes)"
         class="block w-full resize-none rounded-[4px] bg-white px-2.5 py-2 text-[14px] leading-[1.35] text-slate-800 placeholder:text-slate-400
                shadow-[0_1px_0_rgba(9,30,66,.25)] outline-none focus:ring-2 focus:ring-sky-500
                dark:bg-zinc-800 dark:text-zinc-100 dark:placeholder:text-zinc-500"
@@ -68,17 +81,9 @@ export default function Composer(props: { columnId: string }) {
             </button>
           )}
         </For>
-        <button
-          type="button"
-          onClick={() => setAssignee((a) => (a === 'agent' ? 'human' : 'agent'))}
-          class="h-6 rounded-full px-2 text-[11px] font-medium transition-colors"
-          classList={{
-            'bg-violet-600 text-white': assignee() === 'agent',
-            'bg-black/5 text-slate-600 hover:bg-black/10 dark:bg-white/5 dark:text-zinc-400 dark:hover:bg-white/10': assignee() === 'human',
-          }}
-        >
-          {assignee() === 'agent' ? '🤖 Agent' : '👤 Me'}
-        </button>
+      </div>
+      <div class="mt-1.5">
+        <AssigneePicker value={assignee()} onChange={setAssignee} size="sm" />
       </div>
       <div class="mt-2 flex items-center gap-2">
         <button

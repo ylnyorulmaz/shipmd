@@ -1,4 +1,5 @@
 import { For, onCleanup, onMount, Show } from 'solid-js';
+import AssigneeFilterBar from './components/AssigneeFilterBar';
 import BoardColumn from './components/BoardColumn';
 import CardModal from './components/CardModal';
 import Header from './components/Header';
@@ -29,6 +30,7 @@ export default function App() {
   return (
     <div class="flex h-dvh flex-col bg-[#f7f8fa] text-slate-800 dark:bg-zinc-950 dark:text-zinc-100">
       <Header />
+      <AssigneeFilterBar />
       <main class="flex-1 overflow-x-auto overflow-y-hidden">
         <Show
           when={board.loaded}
