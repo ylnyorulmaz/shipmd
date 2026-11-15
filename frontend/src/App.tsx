@@ -66,6 +66,10 @@ export default function App() {
           </div>
         </Show>
       </main>
+      <footer class="flex h-7 shrink-0 items-center border-t border-slate-200 bg-white px-4 text-[11px] text-slate-500 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-400">
+        <span class="font-medium text-slate-600 dark:text-zinc-300">ShipMD</span>
+        <span class="ml-1 hidden sm:inline">— AI-Native Kanban &amp; MCP Workspace</span>
+      </footer>
 
       <Show when={openCardId()}>{(id) => <CardModal id={id()} />}</Show>
       <Show when={createModalOpen()}>

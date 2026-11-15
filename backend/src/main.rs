@@ -60,7 +60,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let db_path = std::env::var("BOARD_DB").unwrap_or_else(|_| "board.db".into());
     let port: u16 = std::env::var("PORT").ok().and_then(|p| p.parse().ok()).unwrap_or(3001);
-    let board_title = std::env::var("BOARD_TITLE").unwrap_or_else(|_| "Ship Board".into());
+    let board_title = std::env::var("BOARD_TITLE").unwrap_or_else(|_| "ShipMD".into());
 
     let pool = db::connect(&db_path).await?;
     let (events, _) = broadcast::channel(256);

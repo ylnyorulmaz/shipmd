@@ -15,7 +15,7 @@ interface BoardState {
 }
 
 export const [board, setBoard] = createStore<BoardState>({
-  title: 'Ship Board',
+  title: 'ShipMD',
   columns: [],
   cards: {},
   loaded: false,

@@ -1,4 +1,4 @@
-# Ship Board
+# ShipMD
 
 A real-time Kanban board for a solo founder and their AI coding agents.
 
@@ -72,7 +72,7 @@ The backend reads environment variables and loads `backend/.env` if it exists. R
 |---|---|---|
 | `PORT` | `3001` | HTTP, WebSocket and MCP port |
 | `BOARD_DB` | `board.db` | SQLite file path; created and seeded if missing |
-| `BOARD_TITLE` | `Ship Board` | Board name in the UI and in Telegram |
+| `BOARD_TITLE` | `ShipMD` | Board name in the UI and in Telegram |
 | `RUST_LOG` | `info,sqlx=warn` | Log level |
 | `BOARD_PASSWORD` | — | If set, the web UI, `/api` and `/ws` need this password: HTTP Basic with any username, then a session cookie. **Required when public.** |
 | `STATIC_DIR` | — | Folder with the built frontend (`frontend/dist`). If set, the backend serves the UI itself. |
