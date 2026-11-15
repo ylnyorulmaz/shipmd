@@ -63,6 +63,68 @@ pub async fn agent_action(
     Ok(Json(card))
 }
 
+pub async fn list_projects(State(state): State<AppState>) -> AppResult<Json<Vec<Project>>> {
+    Ok(Json(service::list_projects(&state).await?))
+}
+
+pub async fn create_project(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<CreateProject>,
+) -> AppResult<(StatusCode, Json<Project>)> {
+    let project = service::create_project(&state, input, origin(&headers)).await?;
+    Ok((StatusCode::CREATED, Json(project)))
+}
+
+pub async fn update_project(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(patch): Json<UpdateProject>,
+) -> AppResult<Json<Project>> {
+    Ok(Json(service::update_project(&state, &id, patch, origin(&headers)).await?))
+}
+
+pub async fn delete_project(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> AppResult<StatusCode> {
+    service::delete_project(&state, &id, origin(&headers)).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn list_assignees(State(state): State<AppState>) -> AppResult<Json<Vec<AssigneeMember>>> {
+    Ok(Json(service::list_assignees(&state).await?))
+}
+
+pub async fn create_assignee(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<CreateAssignee>,
+) -> AppResult<(StatusCode, Json<AssigneeMember>)> {
+    let member = service::create_assignee(&state, input, origin(&headers)).await?;
+    Ok((StatusCode::CREATED, Json(member)))
+}
+
+pub async fn update_assignee(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Json(patch): Json<UpdateAssignee>,
+) -> AppResult<Json<AssigneeMember>> {
+    Ok(Json(service::update_assignee(&state, &id, patch, origin(&headers)).await?))
+}
+
+pub async fn delete_assignee(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> AppResult<StatusCode> {
+    service::delete_assignee(&state, &id, origin(&headers)).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -94,6 +156,16 @@ mod tests {
             .route("/api/board", get(get_board))
             .route("/api/cards", post(create_card))
             .route("/api/cards/{id}", patch(update_card))
+            .route("/api/projects", get(list_projects).post(create_project))
+            .route(
+                "/api/projects/{id}",
+                axum::routing::put(update_project).patch(update_project).delete(delete_project),
+            )
+            .route("/api/assignees", get(list_assignees).post(create_assignee))
+            .route(
+                "/api/assignees/{id}",
+                axum::routing::put(update_assignee).patch(update_assignee).delete(delete_assignee),
+            )
             .with_state(state.clone());
         (app, state, db_path)
     }
@@ -284,6 +356,144 @@ mod tests {
         assert_eq!(patched["repo"], Value::Null);
         assert_eq!(patched["labels"], json!([]));
         assert_eq!(patched["priority"], 8);
+
+        state.pool.close().await;
+        cleanup_db(&db_path);
+    }
+
+    #[tokio::test]
+    async fn projects_and_assignees_crud_endpoints() {
+        let (app, state, db_path) = test_router().await;
+
+        // Create project with slug generation and flexible links
+        let (st, proj) = send_json(
+            &app,
+            "POST",
+            "/api/projects",
+            json!({
+                "name": "Q4 Marketing",
+                "description": "Growth & Ads campaigns",
+                "links": [
+                    { "label": "CRM", "url": "https://crm.example.com" },
+                    { "label": "Ads Panel", "url": "https://ads.example.com" }
+                ]
+            }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED);
+        assert_eq!(proj["id"], "q4-marketing");
+        assert_eq!(proj["name"], "Q4 Marketing");
+        assert_eq!(proj["links"].as_array().unwrap().len(), 2);
+
+        // Update project via PUT
+        let (st, updated_proj) = send_json(
+            &app,
+            "PUT",
+            "/api/projects/q4-marketing",
+            json!({
+                "name": "Q4 Growth",
+                "description": "",
+                "links": [{ "label": "Live", "url": "https://shipmd.app" }]
+            }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(updated_proj["name"], "Q4 Growth");
+        assert_eq!(updated_proj["description"], Value::Null);
+        assert_eq!(updated_proj["links"].as_array().unwrap().len(), 1);
+
+        // Create human & AI assignees
+        let (st, yalin) = send_json(
+            &app,
+            "POST",
+            "/api/assignees",
+            json!({
+                "name": "Yalın",
+                "kind": "human",
+                "role_description": "Founder & Product"
+            }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED);
+        assert_eq!(yalin["id"], "yalin");
+        assert_eq!(yalin["kind"], "human");
+
+        let (st, gpt) = send_json(
+            &app,
+            "POST",
+            "/api/assignees",
+            json!({
+                "name": "ChatGPT",
+                "kind": "ai",
+                "role_description": "Mimari, araştırma ve spec yazar; kod yazmaz"
+            }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED);
+        assert_eq!(gpt["id"], "chatgpt");
+        assert_eq!(gpt["kind"], "ai");
+
+        // Update assignee via PUT
+        let (st, upd_gpt) = send_json(
+            &app,
+            "PUT",
+            "/api/assignees/chatgpt",
+            json!({
+                "role_description": "Spec & architecture reviewer"
+            }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(upd_gpt["role_description"], "Spec & architecture reviewer");
+
+        // GET list endpoints include new items
+        let list_p = app
+            .clone()
+            .oneshot(Request::builder().method("GET").uri("/api/projects").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(list_p.status(), StatusCode::OK);
+        let p_bytes = axum::body::to_bytes(list_p.into_body(), 1024 * 1024).await.unwrap();
+        let p_json: Value = serde_json::from_slice(&p_bytes).unwrap();
+        assert!(p_json.as_array().unwrap().iter().any(|p| p["id"] == "q4-marketing"));
+
+        let list_a = app
+            .clone()
+            .oneshot(Request::builder().method("GET").uri("/api/assignees").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(list_a.status(), StatusCode::OK);
+        let a_bytes = axum::body::to_bytes(list_a.into_body(), 1024 * 1024).await.unwrap();
+        let a_json: Value = serde_json::from_slice(&a_bytes).unwrap();
+        assert!(a_json.as_array().unwrap().iter().any(|a| a["id"] == "yalin"));
+        assert!(a_json.as_array().unwrap().iter().any(|a| a["id"] == "chatgpt"));
+
+        // Delete endpoints
+        let del_p = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/projects/q4-marketing")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(del_p.status(), StatusCode::NO_CONTENT);
+
+        let del_a = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("DELETE")
+                    .uri("/api/assignees/chatgpt")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(del_a.status(), StatusCode::NO_CONTENT);
 
         state.pool.close().await;
         cleanup_db(&db_path);

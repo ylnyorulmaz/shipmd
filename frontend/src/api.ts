@@ -1,4 +1,14 @@
-import type { BoardResponse, Card, CardPatch } from './types';
+import type {
+  AssigneeInput,
+  AssigneeMember,
+  AssigneePatch,
+  BoardResponse,
+  Card,
+  CardPatch,
+  Project,
+  ProjectInput,
+  ProjectPatch,
+} from './types';
 
 const BASE: string = import.meta.env.VITE_API_URL ?? '';
 
@@ -33,6 +43,19 @@ export const api = {
   create: (card: Omit<Card, 'updated_at'>) => req<Card>('POST', '/api/cards', card),
   patch: (id: string, patch: CardPatch) => req<Card>('PATCH', `/api/cards/${id}`, patch),
   remove: (id: string) => req<void>('DELETE', `/api/cards/${id}`),
+  projects: {
+    list: () => req<Project[]>('GET', '/api/projects'),
+    create: (input: ProjectInput) => req<Project>('POST', '/api/projects', input),
+    update: (id: string, patch: ProjectPatch) => req<Project>('PUT', `/api/projects/${encodeURIComponent(id)}`, patch),
+    remove: (id: string) => req<void>('DELETE', `/api/projects/${encodeURIComponent(id)}`),
+  },
+  assignees: {
+    list: () => req<AssigneeMember[]>('GET', '/api/assignees'),
+    create: (input: AssigneeInput) => req<AssigneeMember>('POST', '/api/assignees', input),
+    update: (id: string, patch: AssigneePatch) =>
+      req<AssigneeMember>('PUT', `/api/assignees/${encodeURIComponent(id)}`, patch),
+    remove: (id: string) => req<void>('DELETE', `/api/assignees/${encodeURIComponent(id)}`),
+  },
 };
 
 export function wsUrl(): string {

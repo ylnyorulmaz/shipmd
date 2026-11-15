@@ -7,13 +7,14 @@ import {
   labelFilter,
   repoFilter,
   setAssigneeFilter,
+  setAssigneeModalState,
   setLabelFilter,
+  setProjectModalState,
   setRepoFilter,
 } from '../store';
-import { ASSIGNEE_PRESETS, REPO_PRESETS } from '../types';
 import {
   assigneeDisplay,
-  isBuiltinAssignee,
+  AssigneeKindChip,
   labelStyleFor,
   normalizeAssignee,
   normalizeLabels,
@@ -42,22 +43,37 @@ export default function AssigneeFilterBar() {
       }
     }
 
-    const customAssignees = new Set<string>();
+    const knownAssigneeIds = new Set(board.assignees.map((m) => m.id));
+    const orphanAssignees = new Set<string>();
     for (const k of assigneeCounts.keys()) {
-      if (!isBuiltinAssignee(k)) customAssignees.add(k);
+      if (!knownAssigneeIds.has(k)) orphanAssignees.add(k);
     }
     const activeA = assigneeFilter();
-    if (activeA && !isBuiltinAssignee(activeA)) customAssignees.add(activeA);
-    const assigneeOptions: string[] = [...ASSIGNEE_PRESETS, ...[...customAssignees].sort()];
+    if (activeA && !knownAssigneeIds.has(activeA)) orphanAssignees.add(activeA);
+    const assigneeOptions: string[] = [
+      ...board.assignees.map((m) => m.id),
+      ...[...orphanAssignees].sort(),
+    ];
 
-    const customRepos = new Set<string>();
-    const isPresetRepo = (r: string) => (REPO_PRESETS as readonly string[]).includes(r);
+    const knownProjectIds = new Set(board.projects.map((p) => p.id));
+    const orphanRepos = new Set<string>();
     for (const r of repoCounts.keys()) {
-      if (!isPresetRepo(r)) customRepos.add(r);
+      if (!knownProjectIds.has(r)) orphanRepos.add(r);
     }
     const activeR = repoFilter();
-    if (activeR && !isPresetRepo(activeR)) customRepos.add(activeR);
-    const repoOptions: string[] = [...REPO_PRESETS, ...[...customRepos].sort()];
+    if (activeR && !knownProjectIds.has(activeR)) orphanRepos.add(activeR);
+    const repoOptions = [
+      ...board.projects.map((p) => ({
+        id: p.id,
+        name: p.name,
+        description: p.description,
+      })),
+      ...[...orphanRepos].sort().map((id) => ({
+        id,
+        name: id,
+        description: null as string | null,
+      })),
+    ];
 
     const labelSet = new Set<string>(labelCounts.keys());
     const activeL = labelFilter();
@@ -73,6 +89,18 @@ export default function AssigneeFilterBar() {
       repoOptions,
       labelOptions,
     };
+  });
+
+  const selectedProject = createMemo(() => {
+    const active = repoFilter();
+    if (!active) return null;
+    return board.projects.find((p) => p.id === active) ?? null;
+  });
+
+  const selectedAssignee = createMemo(() => {
+    const active = assigneeFilter();
+    if (!active) return null;
+    return board.assignees.find((a) => a.id === active) ?? null;
   });
 
   return (
@@ -103,20 +131,30 @@ export default function AssigneeFilterBar() {
 
           <For each={stats().assigneeOptions}>
             {(key) => {
-              const d = assigneeDisplay(key);
+              const d = () => assigneeDisplay(key);
               const active = () => assigneeFilter() === key;
               const count = () => stats().assigneeCounts.get(key) ?? 0;
+              const titleText = () => {
+                const info = d();
+                const kindLabel = info.kind === 'ai' ? 'AI Agent' : 'Human';
+                return info.roleDescription
+                  ? `${info.label} (${kindLabel}) — ${info.roleDescription}`
+                  : `${info.label} (${kindLabel})`;
+              };
               return (
                 <button
                   type="button"
+                  title={titleText()}
                   onClick={() => setAssigneeFilter(active() ? null : key)}
                   aria-pressed={active()}
-                  class={`inline-flex h-6 max-w-[168px] shrink-0 items-center gap-1 rounded-full border px-2.5 text-[11px] font-medium transition-colors ${
-                    active() ? d.solid : d.badge
+                  class={`inline-flex h-6 max-w-[184px] shrink-0 items-center gap-1 rounded-full border px-2.5 text-[11px] font-medium transition-colors ${
+                    active() ? d().solid : d().badge
                   }`}
+                  classList={{ 'border-dashed': !active() && d().kind === 'ai' }}
                 >
-                  <span class="shrink-0">{d.icon}</span>
-                  <span class="truncate">{d.label}</span>
+                  <span class="shrink-0">{d().icon}</span>
+                  <span class="truncate">{d().label}</span>
+                  <AssigneeKindChip kind={d().kind} active={active()} />
                   <Show when={count() > 0}>
                     <span class="opacity-70 tabular-nums">{count()}</span>
                   </Show>
@@ -125,18 +163,40 @@ export default function AssigneeFilterBar() {
             }}
           </For>
 
-          <Show when={hasActiveFilters()}>
+          <div class="ml-auto flex shrink-0 items-center gap-1.5 pl-2">
+            <Show when={selectedAssignee()}>
+              {(member) => (
+                <button
+                  type="button"
+                  title={`Üye / Ajan düzenle: ${member().name}`}
+                  aria-label={`Edit ${member().name}`}
+                  onClick={() => setAssigneeModalState({ mode: 'edit', assigneeId: member().id })}
+                  class="inline-flex h-6 items-center gap-1 rounded-full border border-slate-200 bg-white px-2 text-[11px] font-medium text-slate-600 transition-colors hover:border-slate-300 hover:bg-slate-100 hover:text-slate-800 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800"
+                >
+                  <span aria-hidden="true">✎</span>
+                </button>
+              )}
+            </Show>
             <button
               type="button"
-              onClick={clearAllFilters}
-              class="ml-auto inline-flex h-6 shrink-0 items-center gap-1 rounded-full border border-slate-200 bg-slate-100 px-2.5 text-[11px] font-medium text-slate-600 hover:bg-slate-200 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700"
+              onClick={() => setAssigneeModalState({ mode: 'create' })}
+              class="inline-flex h-6 shrink-0 items-center gap-1 rounded-full border border-dashed border-slate-300 bg-white px-2.5 text-[11px] font-medium text-slate-600 transition-colors hover:border-sky-400 hover:text-sky-700 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:border-sky-500 dark:hover:text-sky-300"
             >
-              <span>× Clear filters</span>
+              <span>+ Üye / Ajan</span>
             </button>
-          </Show>
+            <Show when={hasActiveFilters()}>
+              <button
+                type="button"
+                onClick={clearAllFilters}
+                class="inline-flex h-6 shrink-0 items-center gap-1 rounded-full border border-slate-200 bg-slate-100 px-2.5 text-[11px] font-medium text-slate-600 hover:bg-slate-200 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700"
+              >
+                <span>× Clear</span>
+              </button>
+            </Show>
+          </div>
         </div>
 
-        {/* Repo & Label row */}
+        {/* Repo / Project & Label row */}
         <div
           aria-label="Filter by repo and labels"
           class="flex items-center gap-1.5 overflow-x-auto border-t border-slate-200/60 py-1 [scrollbar-width:none] dark:border-zinc-800/60"
@@ -157,21 +217,22 @@ export default function AssigneeFilterBar() {
             All
           </button>
           <For each={stats().repoOptions}>
-            {(repo) => {
-              const active = () => repoFilter() === repo;
-              const count = () => stats().repoCounts.get(repo) ?? 0;
+            {(proj) => {
+              const active = () => repoFilter() === proj.id;
+              const count = () => stats().repoCounts.get(proj.id) ?? 0;
               return (
                 <button
                   type="button"
-                  onClick={() => setRepoFilter(active() ? null : repo)}
+                  title={proj.description ? `${proj.name} — ${proj.description}` : proj.name}
+                  onClick={() => setRepoFilter(active() ? null : proj.id)}
                   aria-pressed={active()}
-                  class={`inline-flex h-5 max-w-[140px] shrink-0 items-center gap-1 rounded-full border px-2 font-mono text-[10.5px] font-medium transition-colors ${
+                  class={`inline-flex h-5 max-w-[160px] shrink-0 items-center gap-1 rounded-full border px-2 font-mono text-[10.5px] font-medium transition-colors ${
                     active()
                       ? 'border-slate-700 bg-slate-700 text-white dark:border-zinc-200 dark:bg-zinc-200 dark:text-zinc-900'
                       : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-100 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800'
                   }`}
                 >
-                  <span class="truncate">{repo}</span>
+                  <span class="truncate">{proj.name}</span>
                   <Show when={count() > 0}>
                     <span class="opacity-70 tabular-nums">{count()}</span>
                   </Show>
@@ -209,6 +270,29 @@ export default function AssigneeFilterBar() {
               }}
             </For>
           </Show>
+
+          <div class="ml-auto flex shrink-0 items-center gap-1.5 pl-2">
+            <Show when={selectedProject()}>
+              {(proj) => (
+                <button
+                  type="button"
+                  title={`Projeyi düzenle: ${proj().name}`}
+                  aria-label={`Edit project ${proj().name}`}
+                  onClick={() => setProjectModalState({ mode: 'edit', projectId: proj().id })}
+                  class="inline-flex h-5 items-center gap-1 rounded-full border border-slate-200 bg-white px-2 text-[10.5px] font-medium text-slate-600 transition-colors hover:border-slate-300 hover:bg-slate-100 hover:text-slate-800 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:bg-zinc-800"
+                >
+                  <span aria-hidden="true">✎</span>
+                </button>
+              )}
+            </Show>
+            <button
+              type="button"
+              onClick={() => setProjectModalState({ mode: 'create' })}
+              class="inline-flex h-5 shrink-0 items-center gap-1 rounded-full border border-dashed border-slate-300 bg-white px-2 text-[10.5px] font-medium text-slate-600 transition-colors hover:border-sky-400 hover:text-sky-700 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-300 dark:hover:border-sky-500 dark:hover:text-sky-300"
+            >
+              <span>+ Proje</span>
+            </button>
+          </div>
         </div>
       </div>
     </Show>

@@ -12,7 +12,7 @@ use std::{net::SocketAddr, path::PathBuf};
 
 use axum::{
     middleware,
-    routing::{get, patch, post},
+    routing::{get, patch, post, put},
     Router,
 };
 use serde_json::{json, Value};
@@ -80,6 +80,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route(
             "/api/cards/{id}",
             patch(routes::update_card).delete(routes::delete_card),
+        )
+        .route(
+            "/api/projects",
+            get(routes::list_projects).post(routes::create_project),
+        )
+        .route(
+            "/api/projects/{id}",
+            put(routes::update_project)
+                .patch(routes::update_project)
+                .delete(routes::delete_project),
+        )
+        .route(
+            "/api/assignees",
+            get(routes::list_assignees).post(routes::create_assignee),
+        )
+        .route(
+            "/api/assignees/{id}",
+            put(routes::update_assignee)
+                .patch(routes::update_assignee)
+                .delete(routes::delete_assignee),
         )
         .route("/api/agent/action", post(routes::agent_action))
         .route("/ws", get(ws::handler))

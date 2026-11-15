@@ -87,6 +87,103 @@ pub struct CardComment {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProjectLink {
+    pub label: String,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Project {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub links: Vec<ProjectLink>,
+    pub updated_at: String,
+}
+
+pub fn parse_stored_links(raw: Option<&str>) -> Vec<ProjectLink> {
+    let Some(s) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Vec::new();
+    };
+    serde_json::from_str::<Vec<ProjectLink>>(s).unwrap_or_default()
+}
+
+impl<'r> FromRow<'r, SqliteRow> for Project {
+    fn from_row(row: &'r SqliteRow) -> Result<Self, sqlx::Error> {
+        let links_raw: Option<String> = row.try_get("links")?;
+        Ok(Self {
+            id: row.try_get("id")?,
+            name: row.try_get("name")?,
+            description: row.try_get("description")?,
+            links: parse_stored_links(links_raw.as_deref()),
+            updated_at: row.try_get("updated_at")?,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateProject {
+    pub id: Option<String>,
+    pub name: String,
+    pub description: Option<String>,
+    #[serde(default)]
+    pub links: Option<Vec<ProjectLink>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct UpdateProject {
+    pub name: Option<String>,
+    /// An empty string clears the description.
+    pub description: Option<String>,
+    pub links: Option<Vec<ProjectLink>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AssigneeKind {
+    Human,
+    Ai,
+}
+
+impl AssigneeKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AssigneeKind::Human => "human",
+            AssigneeKind::Ai => "ai",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, FromRow)]
+pub struct AssigneeMember {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub role_description: Option<String>,
+    pub avatar_badge: Option<String>,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CreateAssignee {
+    pub id: Option<String>,
+    pub name: String,
+    pub kind: AssigneeKind,
+    pub role_description: Option<String>,
+    pub avatar_badge: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct UpdateAssignee {
+    pub name: Option<String>,
+    pub kind: Option<AssigneeKind>,
+    /// An empty string clears role_description.
+    pub role_description: Option<String>,
+    /// An empty string clears avatar_badge.
+    pub avatar_badge: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ColumnWithCards {
     #[serde(flatten)]
@@ -98,6 +195,8 @@ pub struct ColumnWithCards {
 pub struct Board {
     pub title: String,
     pub columns: Vec<ColumnWithCards>,
+    pub projects: Vec<Project>,
+    pub assignees: Vec<AssigneeMember>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]

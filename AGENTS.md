@@ -72,7 +72,7 @@ Run locally with `cd backend && cargo run` (port 3001) and `cd frontend && npm r
     - Supports `initialize`, `notifications/initialized`, `tools/list`, and `tools/call` over `POST /mcp` (Streamable HTTP) as well as legacy SSE (`/mcp/sse`, `/mcp/messages`).
     - A tool failure returns a normal result with `isError: true`, so the model can read it and retry. Use JSON-RPC errors only for protocol problems such as an unknown method or tool.
     - Inputs accept column titles or ids case-insensitively, status values (`todo`, `in_progress`, `review`, `done`, or column names), and full or >=4-char short card ids.
-    - If you add or change a tool, update `tool_definitions()` (strict JSON Schema, `additionalProperties: false`), the `tool_schemas_are_objects` test count (currently 9), and the README tool table.
+    - If you add or change a tool, update `tool_definitions()` (strict JSON Schema, `additionalProperties: false`), the `tool_schemas_are_objects` test count (currently 14), and the README tool table.
 11. **Router wiring:** board routes (`/api/*`, `/ws`, the static fallback) are one router wrapped in `auth::require`. `/healthz` stays outside it and must remain public for Fly health checks. `mcp::router()` brings its own state and bearer auth (`SHIPMD_MCP_TOKEN`), and is `.merge()`d after `.with_state(state)`. CORS goes last. A new board route must sit inside the guarded router.
 12. **Single instance.** Don't add anything that assumes more than one backend process: the broadcast channel is in memory, and Telegram's `getUpdates` allows only one poller.
 

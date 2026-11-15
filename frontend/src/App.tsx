@@ -1,16 +1,20 @@
 import { For, onCleanup, onMount, Show } from 'solid-js';
 import AssigneeFilterBar from './components/AssigneeFilterBar';
+import AssigneeModal from './components/AssigneeModal';
 import BoardColumn from './components/BoardColumn';
 import CardModal from './components/CardModal';
 import CreateCardModal from './components/CreateCardModal';
 import Header from './components/Header';
+import ProjectModal from './components/ProjectModal';
 import {
+  assigneeModalState,
   board,
   composerColumn,
   connectSocket,
   createModalOpen,
   loadBoard,
   openCardId,
+  projectModalState,
   setComposerColumn,
   setCreateModalOpen,
   toast,
@@ -37,7 +41,9 @@ export default function App() {
       !e.altKey &&
       !isTyping(e.target) &&
       !openCardId() &&
-      !createModalOpen()
+      !createModalOpen() &&
+      !projectModalState() &&
+      !assigneeModalState()
     ) {
       e.preventDefault();
       setCreateModalOpen(true);
@@ -74,6 +80,12 @@ export default function App() {
       <Show when={openCardId()}>{(id) => <CardModal id={id()} />}</Show>
       <Show when={createModalOpen()}>
         <CreateCardModal />
+      </Show>
+      <Show when={projectModalState()}>
+        <ProjectModal />
+      </Show>
+      <Show when={assigneeModalState()}>
+        <AssigneeModal />
       </Show>
 
       <Show when={toast()}>

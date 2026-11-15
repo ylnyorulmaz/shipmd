@@ -41,7 +41,10 @@ use tokio::sync::mpsc;
 use crate::{
     db::COLUMNS,
     error::AppError,
-    models::{AgentAction, AgentVerb, Card, CreateCard, PatchCard, Tag},
+    models::{
+        AgentAction, AgentVerb, AssigneeKind, Card, CreateAssignee, CreateCard, CreateProject,
+        PatchCard, ProjectLink, Tag,
+    },
     service::{self, DONE_COLUMN},
     telegram, AppState,
 };
@@ -54,7 +57,8 @@ const DEFAULT_LIST_LIMIT: usize = 50;
 const MAX_LIST_LIMIT: usize = 200;
 
 const INSTRUCTIONS: &str = "Ship Board is the Kanban board you share with a solo founder (columns: Backlog, Build, Sell, Done). \
-Workflow: call list_tasks or pick_next_agent_task to claim work, inspect full details with get_task_details, \
+Workflow: call list_projects / get_project_details and list_assignees to understand workspace context, links, and team roles; \
+call list_tasks or pick_next_agent_task to claim work, inspect full details with get_task_details, \
 log progress / commit hashes / PR links with add_task_comment or update_card_notes, and call update_task_status \
 (in_progress, review, done) as you progress. Every change appears live on the founder's board and phone.";
 
@@ -577,6 +581,94 @@ which is moved to Build and announced to the founder on Telegram. Returns a mess
 When finished, call update_card_notes with what you did, then move_card to Done.",
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
             "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false }
+        },
+        {
+            "name": "list_projects",
+            "title": "List projects",
+            "description": "List all defined projects/workspaces with their descriptions and resource link lists (GitHub, Live, Staging, CRM, Ads, etc.).",
+            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
+            "annotations": { "readOnlyHint": true, "openWorldHint": false }
+        },
+        {
+            "name": "get_project_details",
+            "title": "Get project details",
+            "description": "Fetch the full description and resource links for a single project by id (slug) or name (case-insensitive).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "project": {
+                        "type": "string",
+                        "description": "Project id (slug, e.g. \"shipmd\") or name (e.g. \"ShipMD\"). Case-insensitive."
+                    }
+                },
+                "required": ["project"],
+                "additionalProperties": false
+            },
+            "annotations": { "readOnlyHint": true, "openWorldHint": false }
+        },
+        {
+            "name": "list_assignees",
+            "title": "List assignees",
+            "description": "List all human team members and AI agents with their kind (human|ai), role descriptions, and badges.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": ["human", "ai"],
+                        "description": "Optional filter by member kind (\"human\" or \"ai\")."
+                    }
+                },
+                "additionalProperties": false
+            },
+            "annotations": { "readOnlyHint": true, "openWorldHint": false }
+        },
+        {
+            "name": "create_project",
+            "title": "Create project",
+            "description": "Create a new project/workspace with a name, optional short description/context, and optional resource links.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "maxLength": 64, "description": "Optional slug id (auto-generated from name if omitted)." },
+                    "name": { "type": "string", "minLength": 1, "maxLength": 80, "description": "Project display name (e.g. \"CodeSight\", \"Q4 Marketing\")." },
+                    "description": { "type": "string", "maxLength": 1000, "description": "Short project/context summary." },
+                    "links": {
+                        "type": "array",
+                        "description": "Resource links such as GitHub, Live, Staging, CRM, Ads Panel.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "label": { "type": "string", "minLength": 1, "maxLength": 40 },
+                                "url": { "type": "string", "minLength": 1, "maxLength": 2048 }
+                            },
+                            "required": ["label", "url"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "required": ["name"],
+                "additionalProperties": false
+            },
+            "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false }
+        },
+        {
+            "name": "create_assignee",
+            "title": "Create assignee",
+            "description": "Register a new human team member or AI agent with their kind (human|ai) and role/capability description.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "maxLength": 64, "description": "Optional slug id (auto-generated from name if omitted)." },
+                    "name": { "type": "string", "minLength": 1, "maxLength": 80, "description": "Member or agent display name (e.g. \"Yalın\", \"ChatGPT\")." },
+                    "kind": { "type": "string", "enum": ["human", "ai"], "description": "\"human\" for a person or \"ai\" for an AI agent." },
+                    "role_description": { "type": "string", "maxLength": 1000, "description": "Short role and capability summary." },
+                    "avatar_badge": { "type": "string", "maxLength": 32, "description": "Optional icon/emoji badge." }
+                },
+                "required": ["name", "kind"],
+                "additionalProperties": false
+            },
+            "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": false }
         }
     ])
 }
@@ -604,6 +696,11 @@ async fn call_tool(app: &AppState, name: &str, args: &Value) -> ToolOutcome {
         "move_card" => move_card(app, args).await,
         "update_card_notes" => update_card_notes(app, args).await,
         "pick_next_agent_task" => pick_next_agent_task(app).await,
+        "list_projects" => list_projects(app).await,
+        "get_project_details" => get_project_details(app, args).await,
+        "list_assignees" => list_assignees(app, args).await,
+        "create_project" => create_project(app, args).await,
+        "create_assignee" => create_assignee(app, args).await,
         _ => return ToolOutcome::Unknown,
     };
     tracing::info!(tool = name, ok = result.is_ok(), "MCP tool call");
@@ -945,6 +1042,97 @@ async fn pick_next_agent_task(app: &AppState) -> ToolResult {
     }))
 }
 
+async fn list_projects(app: &AppState) -> ToolResult {
+    let projects = service::list_projects(app).await.map_err(app_err)?;
+    Ok(json!({
+        "count": projects.len(),
+        "projects": projects,
+    }))
+}
+
+async fn get_project_details(app: &AppState, args: &Value) -> ToolResult {
+    let key = str_arg(args, "project")
+        .or_else(|| str_arg(args, "project_id"))
+        .or_else(|| str_arg(args, "id"))
+        .or_else(|| str_arg(args, "name"))
+        .ok_or("project (id or name) is required")?;
+    let project = service::resolve_project(app, key).await.map_err(app_err)?;
+    Ok(json!({
+        "project": project,
+    }))
+}
+
+async fn list_assignees(app: &AppState, args: &Value) -> ToolResult {
+    let kind_filter = match str_arg(args, "kind").map(str::to_ascii_lowercase).as_deref() {
+        None => None,
+        Some("human") => Some("human"),
+        Some("ai") => Some("ai"),
+        Some(other) => return Err(format!("invalid kind '{other}' — use \"human\" or \"ai\"")),
+    };
+    let mut assignees = service::list_assignees(app).await.map_err(app_err)?;
+    if let Some(k) = kind_filter {
+        assignees.retain(|a| a.kind == k);
+    }
+    Ok(json!({
+        "count": assignees.len(),
+        "assignees": assignees,
+    }))
+}
+
+async fn create_project(app: &AppState, args: &Value) -> ToolResult {
+    let name = str_arg(args, "name").ok_or("name is required")?.to_string();
+    let id = str_arg(args, "id").map(str::to_string);
+    let description = args
+        .get("description")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let links = match args.get("links") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            serde_json::from_value::<Vec<ProjectLink>>(v.clone())
+                .map_err(|e| format!("invalid links array: {e}"))?,
+        ),
+    };
+    let project = service::create_project(
+        app,
+        CreateProject { id, name, description, links },
+        Some(ORIGIN.into()),
+    )
+    .await
+    .map_err(app_err)?;
+    Ok(json!({ "project": project }))
+}
+
+async fn create_assignee(app: &AppState, args: &Value) -> ToolResult {
+    let name = str_arg(args, "name").ok_or("name is required")?.to_string();
+    let id = str_arg(args, "id").map(str::to_string);
+    let kind = match str_arg(args, "kind").map(str::to_ascii_lowercase).as_deref() {
+        Some("human") => AssigneeKind::Human,
+        Some("ai") => AssigneeKind::Ai,
+        Some(other) => return Err(format!("invalid kind '{other}' — use \"human\" or \"ai\"")),
+        None => return Err("kind is required (\"human\" or \"ai\")".into()),
+    };
+    let role_description = args
+        .get("role_description")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let avatar_badge = str_arg(args, "avatar_badge").map(str::to_string);
+    let assignee = service::create_assignee(
+        app,
+        CreateAssignee {
+            id,
+            name,
+            kind,
+            role_description,
+            avatar_badge,
+        },
+        Some(ORIGIN.into()),
+    )
+    .await
+    .map_err(app_err)?;
+    Ok(json!({ "assignee": assignee }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1015,7 +1203,7 @@ mod tests {
     fn tool_schemas_are_objects() {
         let tools = tool_definitions();
         let tools = tools.as_array().unwrap();
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 14);
         for t in tools {
             assert_eq!(t["inputSchema"]["type"], "object", "{}", t["name"]);
             assert_eq!(t["inputSchema"]["additionalProperties"], false, "{}", t["name"]);
@@ -1061,7 +1249,7 @@ mod tests {
         )
         .await;
         assert_eq!(st_ok, StatusCode::OK);
-        assert_eq!(body_ok["result"]["tools"].as_array().unwrap().len(), 9);
+        assert_eq!(body_ok["result"]["tools"].as_array().unwrap().len(), 14);
 
         state.pool.close().await;
         cleanup_db(&db_path);
@@ -1358,7 +1546,7 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::OK);
-        assert_eq!(body["result"]["tools"].as_array().unwrap().len(), 9);
+        assert_eq!(body["result"]["tools"].as_array().unwrap().len(), 14);
 
         let (st, _) = post_mcp_uri(
             &guarded,
@@ -1388,7 +1576,7 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::OK);
-        assert_eq!(body["result"]["tools"].as_array().unwrap().len(), 9);
+        assert_eq!(body["result"]["tools"].as_array().unwrap().len(), 14);
 
         let (st, _) = post_mcp_uri(
             &guarded,
@@ -1489,6 +1677,118 @@ mod tests {
         assert!(ep3.starts_with("/mcp/t/sse-tok-123/messages?sessionId="), "got {ep3}");
         let (post_st, _) = post_mcp_uri(&app, &ep3, None, list_req).await;
         assert_eq!(post_st, StatusCode::ACCEPTED);
+
+        state.pool.close().await;
+        cleanup_db(&db_path);
+    }
+
+    #[tokio::test]
+    async fn mcp_projects_and_assignees_tools_end_to_end() {
+        let (state, db_path) = test_app().await;
+        let app = router_with_token(state.clone(), Some(Arc::from("tok-proj")));
+        let auth = Some("Bearer tok-proj");
+
+        // create_project
+        let (st, cp_res) = post_mcp(
+            &app,
+            auth,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "create_project",
+                    "arguments": {
+                        "name": "CodeSight",
+                        "description": "AI code intelligence platform",
+                        "links": [
+                            { "label": "GitHub", "url": "https://github.com/org/codesight" },
+                            { "label": "Live", "url": "https://codesight.dev" }
+                        ]
+                    }
+                }
+            }),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let cp_parsed: Value =
+            serde_json::from_str(cp_res["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(cp_parsed["project"]["id"], "codesight");
+        assert_eq!(cp_parsed["project"]["links"].as_array().unwrap().len(), 2);
+
+        // list_projects
+        let (_, lp_res) = post_mcp(
+            &app,
+            auth,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": { "name": "list_projects", "arguments": {} }
+            }),
+        )
+        .await;
+        let lp_parsed: Value =
+            serde_json::from_str(lp_res["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert!(lp_parsed["projects"].as_array().unwrap().iter().any(|p| p["id"] == "codesight"));
+
+        // get_project_details by name (case-insensitive)
+        let (_, gpd_res) = post_mcp(
+            &app,
+            auth,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": { "name": "get_project_details", "arguments": { "project": "codesight" } }
+            }),
+        )
+        .await;
+        let gpd_parsed: Value =
+            serde_json::from_str(gpd_res["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(gpd_parsed["project"]["name"], "CodeSight");
+        assert_eq!(gpd_parsed["project"]["description"], "AI code intelligence platform");
+
+        // create_assignee (human + ai)
+        let (_, ca_res) = post_mcp(
+            &app,
+            auth,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "create_assignee",
+                    "arguments": {
+                        "name": "ChatGPT",
+                        "kind": "ai",
+                        "role_description": "Architecture & spec writer"
+                    }
+                }
+            }),
+        )
+        .await;
+        let ca_parsed: Value =
+            serde_json::from_str(ca_res["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(ca_parsed["assignee"]["id"], "chatgpt");
+        assert_eq!(ca_parsed["assignee"]["kind"], "ai");
+
+        // list_assignees (all & filtered)
+        let (_, la_res) = post_mcp(
+            &app,
+            auth,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "tools/call",
+                "params": { "name": "list_assignees", "arguments": { "kind": "ai" } }
+            }),
+        )
+        .await;
+        let la_parsed: Value =
+            serde_json::from_str(la_res["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert!(la_parsed["assignees"].as_array().unwrap().iter().any(|a| a["id"] == "chatgpt"));
+        assert!(la_parsed["assignees"].as_array().unwrap().iter().all(|a| a["kind"] == "ai"));
 
         state.pool.close().await;
         cleanup_db(&db_path);

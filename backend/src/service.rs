@@ -221,8 +221,15 @@ pub async fn board(state: &AppState) -> AppResult<Board> {
             ColumnWithCards { column, cards }
         })
         .collect();
+    let projects = list_projects(state).await?;
+    let assignees = list_assignees(state).await?;
 
-    Ok(Board { title: state.board_title.clone(), columns })
+    Ok(Board {
+        title: state.board_title.clone(),
+        columns,
+        projects,
+        assignees,
+    })
 }
 
 /// Build vs. Sell split of shipped (Done) cards — same rule as the web header bar.
@@ -638,4 +645,460 @@ pub async fn add_card_comment(
 
     state.emit("CARD_UPDATED", json!({ "card": card }), origin);
     Ok((card, comment_row))
+}
+
+// ---------------------------------------------------------------------------
+// Projects & Assignees
+// ---------------------------------------------------------------------------
+
+const PROJECT_COLS: &str = "id, name, description, links, updated_at";
+const ASSIGNEE_COLS: &str = "id, name, kind, role_description, avatar_badge, updated_at";
+
+fn slugify(raw: &str, fallback_prefix: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut last_dash = true;
+    for ch in raw.trim().chars() {
+        let mapped = match ch {
+            'ğ' | 'Ğ' => Some('g'),
+            'ü' | 'Ü' => Some('u'),
+            'ş' | 'Ş' => Some('s'),
+            'ı' | 'İ' => Some('i'),
+            'ö' | 'Ö' => Some('o'),
+            'ç' | 'Ç' => Some('c'),
+            c if c.is_ascii_alphanumeric() => Some(c.to_ascii_lowercase()),
+            _ => None,
+        };
+        if let Some(c) = mapped {
+            out.push(c);
+            last_dash = false;
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    let trimmed = out.trim_matches('-');
+    let truncated: String = trimmed.chars().take(64).collect();
+    let final_slug = truncated.trim_matches('-').to_string();
+    if final_slug.is_empty() {
+        let short = &uuid::Uuid::new_v4().to_string()[..8];
+        format!("{fallback_prefix}-{short}")
+    } else {
+        final_slug
+    }
+}
+
+fn clean_slug_id(raw: &str, entity: &str) -> AppResult<String> {
+    let s = raw.trim().to_ascii_lowercase();
+    if s.is_empty() || s.len() > 64 {
+        return Err(AppError::BadRequest(format!(
+            "{entity} id must be 1..=64 chars"
+        )));
+    }
+    if !s
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+    {
+        return Err(AppError::BadRequest(format!(
+            "{entity} id may contain only lowercase letters, digits, '-' or '_'"
+        )));
+    }
+    Ok(s)
+}
+
+async fn unique_slug_for_table(
+    state: &AppState,
+    table: &str,
+    base: &str,
+) -> AppResult<String> {
+    let sql = format!("SELECT id FROM {table} WHERE id = ?");
+    let exists = |candidate: String| {
+        let sql = sql.clone();
+        async move {
+            let row: Option<(String,)> = sqlx::query_as(&sql)
+                .bind(&candidate)
+                .fetch_optional(&state.pool)
+                .await?;
+            Ok::<bool, sqlx::Error>(row.is_some())
+        }
+    };
+
+    if !exists(base.to_string()).await? {
+        return Ok(base.to_string());
+    }
+    for n in 2..=99 {
+        let suffix = format!("-{n}");
+        let prefix: String = base.chars().take(64 - suffix.len()).collect();
+        let candidate = format!("{prefix}{suffix}");
+        if !exists(candidate.clone()).await? {
+            return Ok(candidate);
+        }
+    }
+    let short = &uuid::Uuid::new_v4().to_string()[..8];
+    let prefix: String = base.chars().take(64 - 9).collect();
+    Ok(format!("{prefix}-{short}"))
+}
+
+fn clean_short_name(raw: &str, field: &str) -> AppResult<String> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return Err(AppError::BadRequest(format!("{field} must not be empty")));
+    }
+    if t.chars().count() > 80 || t.chars().any(char::is_control) {
+        return Err(AppError::BadRequest(format!(
+            "{field} must be at most 80 printable chars"
+        )));
+    }
+    Ok(t.to_string())
+}
+
+fn clean_opt_summary(raw: Option<String>, field: &str) -> AppResult<Option<String>> {
+    match raw {
+        None => Ok(None),
+        Some(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return Ok(None);
+            }
+            if trimmed.chars().count() > 1000 {
+                return Err(AppError::BadRequest(format!(
+                    "{field} is too long (max 1000 chars)"
+                )));
+            }
+            Ok(Some(trimmed.to_string()))
+        }
+    }
+}
+
+fn clean_project_links(raw: Vec<ProjectLink>) -> AppResult<Vec<ProjectLink>> {
+    let mut out = Vec::new();
+    for item in raw {
+        let label = item.label.trim();
+        let url = item.url.trim();
+        if label.is_empty() && url.is_empty() {
+            continue;
+        }
+        if label.is_empty() || url.is_empty() {
+            return Err(AppError::BadRequest(
+                "each project link must include both label and url".into(),
+            ));
+        }
+        if label.chars().count() > 40 || label.chars().any(char::is_control) {
+            return Err(AppError::BadRequest(
+                "link label must be at most 40 printable chars".into(),
+            ));
+        }
+        if url.chars().count() > 2048 || url.chars().any(char::is_control) {
+            return Err(AppError::BadRequest(
+                "link url must be at most 2048 printable chars".into(),
+            ));
+        }
+        let lower_url = url.to_ascii_lowercase();
+        if lower_url.starts_with("javascript:") || lower_url.starts_with("data:") {
+            return Err(AppError::BadRequest("link url scheme is not allowed".into()));
+        }
+        out.push(ProjectLink {
+            label: label.to_string(),
+            url: url.to_string(),
+        });
+    }
+    if out.len() > 20 {
+        return Err(AppError::BadRequest(
+            "at most 20 links are allowed per project".into(),
+        ));
+    }
+    Ok(out)
+}
+
+fn clean_avatar_badge(raw: Option<String>) -> AppResult<Option<String>> {
+    match raw {
+        None => Ok(None),
+        Some(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return Ok(None);
+            }
+            if trimmed.chars().count() > 32 || trimmed.chars().any(char::is_control) {
+                return Err(AppError::BadRequest(
+                    "avatar_badge must be at most 32 printable chars".into(),
+                ));
+            }
+            Ok(Some(trimmed.to_string()))
+        }
+    }
+}
+
+fn links_json(links: &[ProjectLink]) -> String {
+    serde_json::to_string(links).unwrap_or_else(|_| "[]".into())
+}
+
+pub async fn list_projects(state: &AppState) -> AppResult<Vec<Project>> {
+    let rows = sqlx::query_as::<_, Project>(&format!(
+        "SELECT {PROJECT_COLS} FROM projects ORDER BY rowid ASC"
+    ))
+    .fetch_all(&state.pool)
+    .await?;
+    Ok(rows)
+}
+
+pub async fn fetch_project(state: &AppState, id: &str) -> AppResult<Project> {
+    let cleaned = id.trim();
+    sqlx::query_as::<_, Project>(&format!(
+        "SELECT {PROJECT_COLS} FROM projects WHERE LOWER(id) = LOWER(?)"
+    ))
+    .bind(cleaned)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| AppError::NotFound(format!("project '{cleaned}' not found")))
+}
+
+pub async fn resolve_project(state: &AppState, id_or_name: &str) -> AppResult<Project> {
+    let key = id_or_name.trim();
+    if key.is_empty() {
+        return Err(AppError::BadRequest("project id or name is required".into()));
+    }
+    if let Some(p) = sqlx::query_as::<_, Project>(&format!(
+        "SELECT {PROJECT_COLS} FROM projects WHERE LOWER(id) = LOWER(?) LIMIT 1"
+    ))
+    .bind(key)
+    .fetch_optional(&state.pool)
+    .await?
+    {
+        return Ok(p);
+    }
+    sqlx::query_as::<_, Project>(&format!(
+        "SELECT {PROJECT_COLS} FROM projects WHERE LOWER(name) = LOWER(?) LIMIT 1"
+    ))
+    .bind(key)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| AppError::NotFound(format!("project '{key}' not found")))
+}
+
+pub async fn create_project(
+    state: &AppState,
+    input: CreateProject,
+    origin: Option<String>,
+) -> AppResult<Project> {
+    let name = clean_short_name(&input.name, "project name")?;
+    let id = match input.id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(raw) => clean_slug_id(raw, "project")?,
+        None => unique_slug_for_table(state, "projects", &slugify(&name, "proj")).await?,
+    };
+    let description = clean_opt_summary(input.description, "description")?;
+    let links = clean_project_links(input.links.unwrap_or_default())?;
+    let updated_at = now();
+
+    let project = Project {
+        id,
+        name,
+        description,
+        links,
+        updated_at,
+    };
+
+    let res = sqlx::query(
+        "INSERT INTO projects (id, name, description, links, updated_at)
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(&project.id)
+    .bind(&project.name)
+    .bind(&project.description)
+    .bind(links_json(&project.links))
+    .bind(&project.updated_at)
+    .execute(&state.pool)
+    .await;
+
+    if let Err(sqlx::Error::Database(e)) = &res {
+        if e.is_unique_violation() {
+            return Err(AppError::BadRequest(format!(
+                "project '{}' already exists",
+                project.id
+            )));
+        }
+    }
+    res?;
+
+    state.emit("PROJECT_CREATED", json!({ "project": project }), origin);
+    Ok(project)
+}
+
+pub async fn update_project(
+    state: &AppState,
+    id: &str,
+    patch: UpdateProject,
+    origin: Option<String>,
+) -> AppResult<Project> {
+    let mut project = fetch_project(state, id).await?;
+    if let Some(name) = patch.name {
+        project.name = clean_short_name(&name, "project name")?;
+    }
+    if let Some(desc) = patch.description {
+        project.description = clean_opt_summary(Some(desc), "description")?;
+    }
+    if let Some(links) = patch.links {
+        project.links = clean_project_links(links)?;
+    }
+    project.updated_at = now();
+
+    sqlx::query(
+        "UPDATE projects SET name = ?, description = ?, links = ?, updated_at = ? WHERE id = ?",
+    )
+    .bind(&project.name)
+    .bind(&project.description)
+    .bind(links_json(&project.links))
+    .bind(&project.updated_at)
+    .bind(&project.id)
+    .execute(&state.pool)
+    .await?;
+
+    state.emit("PROJECT_UPDATED", json!({ "project": project }), origin);
+    Ok(project)
+}
+
+pub async fn delete_project(
+    state: &AppState,
+    id: &str,
+    origin: Option<String>,
+) -> AppResult<Project> {
+    let project = sqlx::query_as::<_, Project>(&format!(
+        "DELETE FROM projects WHERE LOWER(id) = LOWER(?) RETURNING {PROJECT_COLS}"
+    ))
+    .bind(id.trim())
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| AppError::NotFound(format!("project '{id}' not found")))?;
+
+    state.emit("PROJECT_DELETED", json!({ "id": project.id }), origin);
+    Ok(project)
+}
+
+pub async fn list_assignees(state: &AppState) -> AppResult<Vec<AssigneeMember>> {
+    let rows = sqlx::query_as::<_, AssigneeMember>(&format!(
+        "SELECT {ASSIGNEE_COLS} FROM assignees ORDER BY rowid ASC"
+    ))
+    .fetch_all(&state.pool)
+    .await?;
+    Ok(rows)
+}
+
+pub async fn fetch_assignee(state: &AppState, id: &str) -> AppResult<AssigneeMember> {
+    let cleaned = id.trim();
+    sqlx::query_as::<_, AssigneeMember>(&format!(
+        "SELECT {ASSIGNEE_COLS} FROM assignees WHERE LOWER(id) = LOWER(?)"
+    ))
+    .bind(cleaned)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| AppError::NotFound(format!("assignee '{cleaned}' not found")))
+}
+
+pub async fn create_assignee(
+    state: &AppState,
+    input: CreateAssignee,
+    origin: Option<String>,
+) -> AppResult<AssigneeMember> {
+    let name = clean_short_name(&input.name, "assignee name")?;
+    let id = match input.id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(raw) => clean_slug_id(raw, "assignee")?,
+        None => unique_slug_for_table(state, "assignees", &slugify(&name, "member")).await?,
+    };
+    let kind = input.kind.as_str().to_string();
+    let role_description = clean_opt_summary(input.role_description, "role_description")?;
+    let avatar_badge = clean_avatar_badge(input.avatar_badge)?.or_else(|| {
+        Some(match input.kind {
+            AssigneeKind::Human => "👤".into(),
+            AssigneeKind::Ai => "🤖".into(),
+        })
+    });
+    let updated_at = now();
+
+    let member = AssigneeMember {
+        id,
+        name,
+        kind,
+        role_description,
+        avatar_badge,
+        updated_at,
+    };
+
+    let res = sqlx::query(
+        "INSERT INTO assignees (id, name, kind, role_description, avatar_badge, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&member.id)
+    .bind(&member.name)
+    .bind(&member.kind)
+    .bind(&member.role_description)
+    .bind(&member.avatar_badge)
+    .bind(&member.updated_at)
+    .execute(&state.pool)
+    .await;
+
+    if let Err(sqlx::Error::Database(e)) = &res {
+        if e.is_unique_violation() {
+            return Err(AppError::BadRequest(format!(
+                "assignee '{}' already exists",
+                member.id
+            )));
+        }
+    }
+    res?;
+
+    state.emit("ASSIGNEE_CREATED", json!({ "assignee": member }), origin);
+    Ok(member)
+}
+
+pub async fn update_assignee(
+    state: &AppState,
+    id: &str,
+    patch: UpdateAssignee,
+    origin: Option<String>,
+) -> AppResult<AssigneeMember> {
+    let mut member = fetch_assignee(state, id).await?;
+    if let Some(name) = patch.name {
+        member.name = clean_short_name(&name, "assignee name")?;
+    }
+    if let Some(kind) = patch.kind {
+        member.kind = kind.as_str().to_string();
+    }
+    if let Some(role) = patch.role_description {
+        member.role_description = clean_opt_summary(Some(role), "role_description")?;
+    }
+    if let Some(badge) = patch.avatar_badge {
+        member.avatar_badge = clean_avatar_badge(Some(badge))?;
+    }
+    member.updated_at = now();
+
+    sqlx::query(
+        "UPDATE assignees SET name = ?, kind = ?, role_description = ?, avatar_badge = ?, updated_at = ?
+         WHERE id = ?",
+    )
+    .bind(&member.name)
+    .bind(&member.kind)
+    .bind(&member.role_description)
+    .bind(&member.avatar_badge)
+    .bind(&member.updated_at)
+    .bind(&member.id)
+    .execute(&state.pool)
+    .await?;
+
+    state.emit("ASSIGNEE_UPDATED", json!({ "assignee": member }), origin);
+    Ok(member)
+}
+
+pub async fn delete_assignee(
+    state: &AppState,
+    id: &str,
+    origin: Option<String>,
+) -> AppResult<AssigneeMember> {
+    let member = sqlx::query_as::<_, AssigneeMember>(&format!(
+        "DELETE FROM assignees WHERE LOWER(id) = LOWER(?) RETURNING {ASSIGNEE_COLS}"
+    ))
+    .bind(id.trim())
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| AppError::NotFound(format!("assignee '{id}' not found")))?;
+
+    state.emit("ASSIGNEE_DELETED", json!({ "id": member.id }), origin);
+    Ok(member)
 }

@@ -2,7 +2,21 @@ import { createSignal } from 'solid-js';
 import { createStore, produce, reconcile } from 'solid-js/store';
 import { api, CLIENT_ID, uuid, wsUrl } from './api';
 import { flip, prefersReducedMotion } from './flip';
-import { ASSIGNEE_PRESETS, type Assignee, type Card, type CardPatch, type Column, type Tag, type WsEvent } from './types';
+import {
+  ASSIGNEE_PRESETS,
+  type Assignee,
+  type AssigneeInput,
+  type AssigneeMember,
+  type AssigneePatch,
+  type Card,
+  type CardPatch,
+  type Column,
+  type Project,
+  type ProjectInput,
+  type ProjectPatch,
+  type Tag,
+  type WsEvent,
+} from './types';
 import { normalizeAssignee, normalizeLabels, normalizeRepo } from './ui';
 
 export const GAP = 1024;
@@ -11,6 +25,8 @@ interface BoardState {
   title: string;
   columns: Column[];
   cards: Record<string, Card>;
+  projects: Project[];
+  assignees: AssigneeMember[];
   loaded: boolean;
 }
 
@@ -18,6 +34,8 @@ export const [board, setBoard] = createStore<BoardState>({
   title: 'ShipMD',
   columns: [],
   cards: {},
+  projects: [],
+  assignees: [],
   loaded: false,
 });
 
@@ -25,9 +43,21 @@ export const [board, setBoard] = createStore<BoardState>({
 // UI state
 // ---------------------------------------------------------------------------
 
+export type ProjectModalState =
+  | null
+  | { mode: 'create'; onCreated?: (project: Project) => void }
+  | { mode: 'edit'; projectId: string };
+
+export type AssigneeModalState =
+  | null
+  | { mode: 'create'; onCreated?: (member: AssigneeMember) => void }
+  | { mode: 'edit'; assigneeId: string };
+
 export const [connected, setConnected] = createSignal(false);
 export const [openCardId, setOpenCardId] = createSignal<string | null>(null);
 export const [createModalOpen, setCreateModalOpen] = createSignal(false);
+export const [projectModalState, setProjectModalState] = createSignal<ProjectModalState>(null);
+export const [assigneeModalState, setAssigneeModalState] = createSignal<AssigneeModalState>(null);
 /** Column whose inline "add card" composer is open. */
 export const [composerColumn, setComposerColumn] = createSignal<string | null>(null);
 /** Active filters (`null` shows all cards). */
@@ -92,6 +122,8 @@ export async function loadBoard() {
     setBoard('title', res.title);
     setBoard('columns', reconcile(res.columns.map(({ cards: _, ...col }) => col), { key: 'id' }));
     setBoard('cards', reconcile(cards));
+    setBoard('projects', reconcile(res.projects ?? [], { key: 'id' }));
+    setBoard('assignees', reconcile(res.assignees ?? [], { key: 'id' }));
     setBoard('loaded', true);
     document.title = res.title;
   } catch (e) {
@@ -160,8 +192,9 @@ export function toggleAssignee(id: string) {
   const card = board.cards[id];
   if (!card) return;
   const current = normalizeAssignee(card.assignee);
-  const idx = ASSIGNEE_PRESETS.indexOf(current as (typeof ASSIGNEE_PRESETS)[number]);
-  const next: Assignee = ASSIGNEE_PRESETS[(idx + 1) % ASSIGNEE_PRESETS.length];
+  const pool: string[] = board.assignees.length > 0 ? board.assignees.map((a) => a.id) : [...ASSIGNEE_PRESETS];
+  const idx = pool.indexOf(current);
+  const next: Assignee = pool[(idx + 1) % pool.length] ?? 'human';
   return updateCard(id, { assignee: next });
 }
 
@@ -226,6 +259,120 @@ function removeLocal(id: string) {
       delete cards[id];
     }),
   );
+}
+
+// ---------------------------------------------------------------------------
+// Projects & Assignees mutations
+// ---------------------------------------------------------------------------
+
+function upsertProjectLocal(project: Project) {
+  setBoard(
+    'projects',
+    produce((list) => {
+      const idx = list.findIndex((p) => p.id === project.id);
+      if (idx >= 0) list[idx] = project;
+      else list.push(project);
+    }),
+  );
+}
+
+function removeProjectLocal(id: string) {
+  setBoard(
+    'projects',
+    produce((list) => {
+      const idx = list.findIndex((p) => p.id === id);
+      if (idx >= 0) list.splice(idx, 1);
+    }),
+  );
+  if (repoFilter() === id) setRepoFilter(null);
+}
+
+function upsertAssigneeLocal(member: AssigneeMember) {
+  setBoard(
+    'assignees',
+    produce((list) => {
+      const idx = list.findIndex((a) => a.id === member.id);
+      if (idx >= 0) list[idx] = member;
+      else list.push(member);
+    }),
+  );
+}
+
+function removeAssigneeLocal(id: string) {
+  setBoard(
+    'assignees',
+    produce((list) => {
+      const idx = list.findIndex((a) => a.id === id);
+      if (idx >= 0) list.splice(idx, 1);
+    }),
+  );
+  if (assigneeFilter() === id) setAssigneeFilter(null);
+}
+
+export async function createProject(input: ProjectInput): Promise<Project | null> {
+  try {
+    const saved = await api.projects.create(input);
+    upsertProjectLocal(saved);
+    return saved;
+  } catch (e) {
+    showToast(`Could not create project: ${(e as Error).message}`);
+    return null;
+  }
+}
+
+export async function updateProject(id: string, patch: ProjectPatch): Promise<Project | null> {
+  try {
+    const saved = await api.projects.update(id, patch);
+    upsertProjectLocal(saved);
+    return saved;
+  } catch (e) {
+    showToast(`Could not update project: ${(e as Error).message}`);
+    return null;
+  }
+}
+
+export async function deleteProject(id: string): Promise<boolean> {
+  try {
+    await api.projects.remove(id);
+    removeProjectLocal(id);
+    return true;
+  } catch (e) {
+    showToast(`Could not delete project: ${(e as Error).message}`);
+    return false;
+  }
+}
+
+export async function createAssignee(input: AssigneeInput): Promise<AssigneeMember | null> {
+  try {
+    const saved = await api.assignees.create(input);
+    upsertAssigneeLocal(saved);
+    return saved;
+  } catch (e) {
+    showToast(`Could not add member: ${(e as Error).message}`);
+    return null;
+  }
+}
+
+export async function updateAssignee(id: string, patch: AssigneePatch): Promise<AssigneeMember | null> {
+  try {
+    const saved = await api.assignees.update(id, patch);
+    upsertAssigneeLocal(saved);
+    return saved;
+  } catch (e) {
+    showToast(`Could not update member: ${(e as Error).message}`);
+    return null;
+  }
+}
+
+export async function deleteAssignee(id: string): Promise<boolean> {
+  try {
+    await api.assignees.remove(id);
+    removeAssigneeLocal(id);
+    return true;
+  } catch (e) {
+    showToast(`Could not delete member: ${(e as Error).message}`);
+    return false;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -322,6 +469,24 @@ function applyEvent(ev: WsEvent) {
       else setBoard('cards', ev.card.id, ev.card);
       return;
     }
+    case 'PROJECT_CREATED':
+    case 'PROJECT_UPDATED':
+      if (ev.origin === CLIENT_ID) return;
+      upsertProjectLocal(ev.project);
+      return;
+    case 'PROJECT_DELETED':
+      if (ev.origin === CLIENT_ID) return;
+      removeProjectLocal(ev.id);
+      return;
+    case 'ASSIGNEE_CREATED':
+    case 'ASSIGNEE_UPDATED':
+      if (ev.origin === CLIENT_ID) return;
+      upsertAssigneeLocal(ev.assignee);
+      return;
+    case 'ASSIGNEE_DELETED':
+      if (ev.origin === CLIENT_ID) return;
+      removeAssigneeLocal(ev.id);
+      return;
   }
 }
 
