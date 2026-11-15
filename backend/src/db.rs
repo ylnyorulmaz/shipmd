@@ -41,6 +41,32 @@ CREATE TABLE IF NOT EXISTS card_comments (
 CREATE INDEX IF NOT EXISTS idx_card_comments_card_created ON card_comments(card_id, created_at);
 "#;
 
+const SEED_PROJECTS: [(&str, &str, Option<&str>); 4] = [
+    (
+        "shipmd",
+        "ShipMD",
+        Some("Real-time Kanban & MCP workspace for solo founders and AI agents."),
+    ),
+    ("ceviz-ai", "ceviz-ai", None),
+    ("antisocial", "antisocial", None),
+    ("kahvefalim", "kahvefalim", None),
+];
+
+/// (id, name, kind, role_description, avatar_badge)
+const SEED_ASSIGNEES: [(&str, &str, &str, &str, &str); 5] = [
+    ("human", "Me", "human", "Founder / Human owner", "👤"),
+    (
+        "antigravity",
+        "Antigravity",
+        "ai",
+        "Autonomous full-stack coding agent",
+        "🚀",
+    ),
+    ("kimi", "Kimi", "ai", "UI & full-stack coding agent", "🌙"),
+    ("hermes", "Hermes", "ai", "Autonomous coding & ops agent", "⚡"),
+    ("agent", "Agent", "ai", "General AI coding agent", "🤖"),
+];
+
 pub const COLUMNS: [(&str, &str); 4] = [
     ("backlog", "Backlog"),
     ("build", "Build"),
@@ -269,6 +295,145 @@ pub async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_cards_repo ON cards(repo)")
         .execute(pool)
         .await?;
+
+    migrate_projects(pool).await?;
+    migrate_assignees(pool).await?;
+    Ok(())
+}
+
+async fn table_exists(pool: &SqlitePool, name: &str) -> Result<bool, sqlx::Error> {
+    let row: Option<(String,)> =
+        sqlx::query_as("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?")
+            .bind(name)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.is_some())
+}
+
+async fn migrate_projects(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    let existed = table_exists(pool, "projects").await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS projects (
+            id          TEXT PRIMARY KEY,
+            name        TEXT NOT NULL,
+            description TEXT,
+            links       TEXT NOT NULL DEFAULT '[]',
+            updated_at  TEXT NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    if existed {
+        return Ok(());
+    }
+
+    let now = crate::now();
+    let mut seen = HashSet::new();
+    for (id, name, desc) in SEED_PROJECTS {
+        seen.insert(id.to_string());
+        sqlx::query(
+            "INSERT OR IGNORE INTO projects (id, name, description, links, updated_at)
+             VALUES (?, ?, ?, '[]', ?)",
+        )
+        .bind(id)
+        .bind(name)
+        .bind(desc)
+        .bind(&now)
+        .execute(pool)
+        .await?;
+    }
+
+    let card_repos: Vec<(String,)> = sqlx::query_as(
+        "SELECT DISTINCT LOWER(TRIM(repo)) FROM cards
+         WHERE repo IS NOT NULL AND TRIM(repo) != ''",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    for (repo,) in card_repos {
+        if !seen.insert(repo.clone()) {
+            continue;
+        }
+        sqlx::query(
+            "INSERT OR IGNORE INTO projects (id, name, description, links, updated_at)
+             VALUES (?, ?, NULL, '[]', ?)",
+        )
+        .bind(&repo)
+        .bind(&repo)
+        .bind(&now)
+        .execute(pool)
+        .await?;
+    }
+
+    tracing::info!("initialized projects table");
+    Ok(())
+}
+
+async fn migrate_assignees(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    let existed = table_exists(pool, "assignees").await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS assignees (
+            id               TEXT PRIMARY KEY,
+            name             TEXT NOT NULL,
+            kind             TEXT NOT NULL CHECK (kind IN ('human', 'ai')),
+            role_description TEXT,
+            avatar_badge     TEXT,
+            updated_at       TEXT NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    if existed {
+        return Ok(());
+    }
+
+    let now = crate::now();
+    let mut seen = HashSet::new();
+    for (id, name, kind, role, badge) in SEED_ASSIGNEES {
+        seen.insert(id.to_string());
+        sqlx::query(
+            "INSERT OR IGNORE INTO assignees (id, name, kind, role_description, avatar_badge, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(name)
+        .bind(kind)
+        .bind(role)
+        .bind(badge)
+        .bind(&now)
+        .execute(pool)
+        .await?;
+    }
+
+    let card_assignees: Vec<(String,)> = sqlx::query_as(
+        "SELECT DISTINCT LOWER(TRIM(assignee)) FROM cards
+         WHERE assignee IS NOT NULL AND TRIM(assignee) != ''",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    for (assignee,) in card_assignees {
+        if !seen.insert(assignee.clone()) {
+            continue;
+        }
+        let kind = if assignee == "human" { "human" } else { "ai" };
+        let badge = if kind == "human" { "👤" } else { "🤖" };
+        sqlx::query(
+            "INSERT OR IGNORE INTO assignees (id, name, kind, role_description, avatar_badge, updated_at)
+             VALUES (?, ?, ?, NULL, ?, ?)",
+        )
+        .bind(&assignee)
+        .bind(&assignee)
+        .bind(kind)
+        .bind(badge)
+        .bind(&now)
+        .execute(pool)
+        .await?;
+    }
+
+    tracing::info!("initialized assignees table");
     Ok(())
 }
 
@@ -437,6 +602,79 @@ mod tests {
         assert_eq!(labels, "[]");
 
         migrated.close().await;
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{path}-wal"));
+        let _ = std::fs::remove_file(format!("{path}-shm"));
+    }
+
+    #[tokio::test]
+    async fn migrates_existing_repos_and_assignees_into_tables_once() {
+        let path = format!("/tmp/shipmd_migrate_proj_assg_{}.db", uuid::Uuid::new_v4());
+        let opts = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new().max_connections(1).connect_with(opts).await.unwrap();
+
+        sqlx::raw_sql(
+            r#"
+            CREATE TABLE columns (id TEXT PRIMARY KEY, title TEXT NOT NULL, position INTEGER NOT NULL);
+            CREATE TABLE cards (
+                id          TEXT PRIMARY KEY,
+                column_id   TEXT NOT NULL REFERENCES columns(id) ON DELETE CASCADE,
+                title       TEXT NOT NULL,
+                description TEXT,
+                tag         TEXT NOT NULL CHECK (tag IN ('build', 'sell', 'ops')),
+                assignee    TEXT NOT NULL DEFAULT 'human',
+                status      TEXT NOT NULL DEFAULT 'todo',
+                priority    INTEGER NOT NULL DEFAULT 0,
+                pr_url      TEXT,
+                repo        TEXT,
+                labels      TEXT NOT NULL DEFAULT '[]',
+                position    REAL NOT NULL,
+                updated_at  TEXT NOT NULL
+            );
+            INSERT INTO columns (id, title, position) VALUES ('backlog', 'Backlog', 0);
+            INSERT INTO cards (id, column_id, title, description, tag, assignee, status, priority, pr_url, repo, labels, position, updated_at)
+            VALUES ('c1', 'backlog', 'Custom card', NULL, 'build', 'codex', 'todo', 0, NULL, 'codesight', '[]', 1024.0, '2026-01-01T00:00:00Z');
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        let migrated = connect(&path).await.unwrap();
+        let (proj_name,): (String,) =
+            sqlx::query_as("SELECT name FROM projects WHERE id = 'codesight'")
+                .fetch_one(&migrated)
+                .await
+                .unwrap();
+        assert_eq!(proj_name, "codesight");
+
+        let (assg_kind,): (String,) =
+            sqlx::query_as("SELECT kind FROM assignees WHERE id = 'codex'")
+                .fetch_one(&migrated)
+                .await
+                .unwrap();
+        assert_eq!(assg_kind, "ai");
+
+        // Deleting a seeded project stays deleted on reconnect.
+        sqlx::query("DELETE FROM projects WHERE id = 'kahvefalim'")
+            .execute(&migrated)
+            .await
+            .unwrap();
+        migrated.close().await;
+
+        let reopened = connect(&path).await.unwrap();
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT id FROM projects WHERE id = 'kahvefalim'")
+                .fetch_optional(&reopened)
+                .await
+                .unwrap();
+        assert!(row.is_none());
+
+        reopened.close().await;
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(format!("{path}-wal"));
         let _ = std::fs::remove_file(format!("{path}-shm"));

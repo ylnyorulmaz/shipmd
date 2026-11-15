@@ -1,5 +1,14 @@
-import { createSignal, For, Show } from 'solid-js';
-import { ASSIGNEE_PRESETS, PRIORITY_OPTIONS, REPO_PRESETS, type Assignee, type BuiltinAssignee, type Tag } from './types';
+import { createMemo, createSignal, For, Show } from 'solid-js';
+import { board, setAssigneeModalState, setProjectModalState } from './store';
+import {
+  ASSIGNEE_PRESETS,
+  PRIORITY_OPTIONS,
+  type Assignee,
+  type AssigneeKind,
+  type AssigneeMember,
+  type BuiltinAssignee,
+  type Tag,
+} from './types';
 
 export const TAG_LABEL: Record<Tag, string> = { build: 'Build', sell: 'Sell', ops: 'Ops' };
 
@@ -70,6 +79,12 @@ const BUILTIN_ASSIGNEE_STYLE: Record<BuiltinAssignee, AssigneeStyle> = {
   },
 };
 
+const HUMAN_CUSTOM_PALETTE: { badge: string; solid: string } = {
+  badge:
+    'border-stone-300 bg-stone-50 text-stone-700 hover:bg-stone-100 dark:border-zinc-600 dark:bg-zinc-700/50 dark:text-zinc-200 dark:hover:bg-zinc-700',
+  solid: 'border-stone-700 bg-stone-700 text-white dark:border-zinc-200 dark:bg-zinc-200 dark:text-zinc-900',
+};
+
 const CUSTOM_PALETTE: { badge: string; solid: string }[] = [
   {
     badge:
@@ -107,16 +122,57 @@ function customPaletteFor(name: string) {
   return CUSTOM_PALETTE[hash % CUSTOM_PALETTE.length];
 }
 
-export function assigneeDisplay(raw: Assignee) {
+export interface AssigneeDisplay {
+  key: string;
+  icon: string;
+  label: string;
+  kind: AssigneeKind;
+  roleDescription: string | null;
+  badge: string;
+  solid: string;
+  isCustom: boolean;
+}
+
+export function assigneeDisplay(raw: Assignee, memberOverride?: AssigneeMember): AssigneeDisplay {
   const key = normalizeAssignee(raw) || 'human';
+  const member = memberOverride ?? board.assignees.find((m) => m.id === key);
+
+  if (member) {
+    const kind: AssigneeKind = member.kind === 'human' ? 'human' : 'ai';
+    const builtin = isBuiltinAssignee(key) ? BUILTIN_ASSIGNEE_STYLE[key] : null;
+    const palette = builtin
+      ? { badge: builtin.badge, solid: builtin.solid }
+      : kind === 'human'
+        ? HUMAN_CUSTOM_PALETTE
+        : customPaletteFor(key);
+    return {
+      key,
+      icon: member.avatar_badge || builtin?.icon || (kind === 'human' ? '👤' : '🤖'),
+      label: member.name || builtin?.label || key,
+      kind,
+      roleDescription: member.role_description ?? null,
+      badge: palette.badge,
+      solid: palette.solid,
+      isCustom: false,
+    };
+  }
+
   if (isBuiltinAssignee(key)) {
-    return { key, ...BUILTIN_ASSIGNEE_STYLE[key], isCustom: false };
+    return {
+      key,
+      ...BUILTIN_ASSIGNEE_STYLE[key],
+      kind: key === 'human' ? 'human' : 'ai',
+      roleDescription: null,
+      isCustom: false,
+    };
   }
   const palette = customPaletteFor(key);
   return {
     key,
     icon: '✦',
     label: key,
+    kind: 'ai',
+    roleDescription: null,
     badge: palette.badge,
     solid: palette.solid,
     isCustom: true,
@@ -128,12 +184,33 @@ export const assigneeLabel = (a: Assignee) => {
   return `${d.icon} ${d.label}`;
 };
 
+export function AssigneeKindChip(props: { kind: AssigneeKind; active?: boolean }) {
+  return (
+    <Show when={props.kind === 'ai'}>
+      <span
+        class={`shrink-0 rounded px-1 py-px text-[8.5px] leading-none font-bold uppercase tracking-wider ${
+          props.active
+            ? 'bg-white/25 text-white'
+            : 'bg-black/8 text-current opacity-75 dark:bg-white/12'
+        }`}
+      >
+        AI
+      </span>
+    </Show>
+  );
+}
+
 export function AssigneeBadge(props: { assignee: Assignee; onToggle?: () => void; size?: 'sm' | 'md' }) {
   const d = () => assigneeDisplay(props.assignee);
+  const titleText = () => {
+    const base = `${d().label} (${d().kind === 'ai' ? 'AI Agent' : 'Human'})`;
+    const withRole = d().roleDescription ? `${base} — ${d().roleDescription}` : base;
+    return props.onToggle ? `${withRole} · click to cycle assignee` : withRole;
+  };
   return (
     <button
       type="button"
-      title={`Assigned to ${d().label}${props.onToggle ? ' — click to cycle assignee' : ''}`}
+      title={titleText()}
       onClick={(e) => {
         if (!props.onToggle) return;
         e.stopPropagation();
@@ -141,14 +218,16 @@ export function AssigneeBadge(props: { assignee: Assignee; onToggle?: () => void
       }}
       onMouseDown={(e) => e.stopPropagation()}
       draggable={false}
-      class={`inline-flex max-w-[168px] cursor-pointer select-none items-center gap-1 rounded-full border font-medium transition-colors ${d().badge}`}
+      class={`inline-flex max-w-[184px] cursor-pointer select-none items-center gap-1 rounded-full border font-medium transition-colors ${d().badge}`}
       classList={{
         'h-[22px] px-2 text-[11px]': props.size !== 'md',
         'h-7 px-3 text-xs': props.size === 'md',
+        'border-dashed': d().kind === 'ai',
       }}
     >
       <span class="shrink-0">{d().icon}</span>
       <span class="truncate">{d().label}</span>
+      <AssigneeKindChip kind={d().kind} />
     </button>
   );
 }
@@ -163,7 +242,19 @@ export function AssigneePicker(props: {
   let customInput: HTMLInputElement | undefined;
 
   const currentKey = () => normalizeAssignee(props.value) || 'human';
-  const isCustomActive = () => !isBuiltinAssignee(currentKey());
+  const knownAssignees = createMemo(() => {
+    if (board.assignees.length > 0) return board.assignees;
+    return ASSIGNEE_PRESETS.map((id) => ({
+      id,
+      name: BUILTIN_ASSIGNEE_STYLE[id].label,
+      kind: (id === 'human' ? 'human' : 'ai') as AssigneeKind,
+      role_description: null,
+      avatar_badge: BUILTIN_ASSIGNEE_STYLE[id].icon,
+      updated_at: '',
+    }));
+  });
+  const isKnown = (k: string) => knownAssignees().some((m) => m.id === k);
+  const isCustomActive = () => !isKnown(currentKey());
   const compact = () => props.size !== 'md';
 
   const openCustom = () => {
@@ -188,26 +279,28 @@ export function AssigneePicker(props: {
 
   return (
     <div class="flex flex-wrap items-center gap-1.5">
-      <For each={ASSIGNEE_PRESETS}>
-        {(preset) => {
-          const d = BUILTIN_ASSIGNEE_STYLE[preset];
-          const active = () => currentKey() === preset && !editingCustom();
+      <For each={knownAssignees()}>
+        {(member) => {
+          const d = () => assigneeDisplay(member.id, member);
+          const active = () => currentKey() === member.id && !editingCustom();
           return (
             <button
               type="button"
+              title={member.role_description ? `${member.name} — ${member.role_description}` : member.name}
               onClick={() => {
                 setEditingCustom(false);
-                props.onChange(preset);
+                props.onChange(member.id);
               }}
               aria-pressed={active()}
               class={`inline-flex items-center gap-1 rounded-full border font-medium transition-colors ${pillSize()} ${
                 active()
-                  ? d.solid
+                  ? d().solid
                   : 'border-transparent bg-black/5 text-slate-600 hover:bg-black/10 dark:bg-white/5 dark:text-zinc-400 dark:hover:bg-white/10'
               }`}
             >
-              <span>{d.icon}</span>
-              <span>{d.label}</span>
+              <span>{d().icon}</span>
+              <span>{d().label}</span>
+              <AssigneeKindChip kind={d().kind} active={active()} />
             </button>
           );
         }}
@@ -231,13 +324,29 @@ export function AssigneePicker(props: {
       <Show
         when={editingCustom()}
         fallback={
-          <button
-            type="button"
-            onClick={openCustom}
-            class={`inline-flex items-center gap-1 rounded-full border border-dashed border-slate-300 font-medium text-slate-500 transition-colors hover:border-slate-400 hover:text-slate-700 dark:border-zinc-700 dark:text-zinc-400 dark:hover:border-zinc-500 dark:hover:text-zinc-200 ${pillSize()}`}
-          >
-            {isCustomActive() ? '✎ Edit' : '+ Custom…'}
-          </button>
+          <>
+            <button
+              type="button"
+              onClick={openCustom}
+              class={`inline-flex items-center gap-1 rounded-full border border-dashed border-slate-300 font-medium text-slate-500 transition-colors hover:border-slate-400 hover:text-slate-700 dark:border-zinc-700 dark:text-zinc-400 dark:hover:border-zinc-500 dark:hover:text-zinc-200 ${pillSize()}`}
+            >
+              {isCustomActive() ? '✎ Edit' : '+ Custom…'}
+            </button>
+            <Show when={!compact()}>
+              <button
+                type="button"
+                onClick={() =>
+                  setAssigneeModalState({
+                    mode: 'create',
+                    onCreated: (m) => props.onChange(m.id),
+                  })
+                }
+                class={`inline-flex items-center gap-1 rounded-full border border-sky-300/80 bg-sky-50 font-medium text-sky-700 transition-colors hover:bg-sky-100 dark:border-sky-500/30 dark:bg-sky-500/10 dark:text-sky-300 dark:hover:bg-sky-500/20 ${pillSize()}`}
+              >
+                + Üye / Ajan
+              </button>
+            </Show>
+          </>
         }
       >
         <div class="inline-flex items-center gap-1">
@@ -313,15 +422,19 @@ export function normalizeLabels(items: readonly string[] | null | undefined): st
 }
 
 export function RepoBadge(props: { repo: string }) {
+  const project = createMemo(() => board.projects.find((p) => p.id === normalizeRepo(props.repo)));
+  const label = () => project()?.name ?? props.repo;
+  const titleText = () =>
+    project()?.description ? `${label()} — ${project()!.description}` : `Project: ${label()}`;
   return (
     <span
-      title={`Repo: ${props.repo}`}
-      class="inline-flex h-[18px] max-w-[116px] items-center gap-1 rounded-[3px] border border-slate-200 bg-slate-100/80 px-1.5 font-mono text-[10.5px] font-medium text-slate-700 dark:border-zinc-700 dark:bg-zinc-700/60 dark:text-zinc-300"
+      title={titleText()}
+      class="inline-flex h-[18px] max-w-[132px] items-center gap-1 rounded-[3px] border border-slate-200 bg-slate-100/80 px-1.5 font-mono text-[10.5px] font-medium text-slate-700 dark:border-zinc-700 dark:bg-zinc-700/60 dark:text-zinc-300"
     >
       <svg viewBox="0 0 16 16" class="h-2.5 w-2.5 shrink-0 opacity-70" fill="currentColor" aria-hidden="true">
         <path d="M2 2.5A2.5 2.5 0 0 1 4.5 0h8.75a.75.75 0 0 1 .75.75v12.5a.75.75 0 0 1-.75.75h-2.5a.75.75 0 0 1 0-1.5h1.75v-2h-8a1 1 0 0 0-.714 1.7.75.75 0 1 1-1.072 1.05A2.495 2.495 0 0 1 2 11.5Zm10.5-1h-8a1 1 0 0 0-1 1v6.708A2.486 2.486 0 0 1 4.5 9h8Z" />
       </svg>
-      <span class="truncate">{props.repo}</span>
+      <span class="truncate">{label()}</span>
     </span>
   );
 }
@@ -440,9 +553,8 @@ export function RepoPicker(props: {
   let customInput: HTMLInputElement | undefined;
 
   const currentKey = () => (props.value ? normalizeRepo(props.value) : null);
-  const isPreset = (r: string | null): r is (typeof REPO_PRESETS)[number] =>
-    !!r && (REPO_PRESETS as readonly string[]).includes(r);
-  const isCustomActive = () => !!currentKey() && !isPreset(currentKey());
+  const isKnown = (r: string | null) => !!r && board.projects.some((p) => p.id === r);
+  const isCustomActive = () => !!currentKey() && !isKnown(currentKey());
   const compact = () => props.size !== 'md';
   const pillSize = () => (compact() ? 'h-6 px-2 text-[11px]' : 'h-7 px-2.5 text-xs');
 
@@ -464,15 +576,16 @@ export function RepoPicker(props: {
 
   return (
     <div class="flex flex-wrap items-center gap-1.5">
-      <For each={REPO_PRESETS}>
-        {(preset) => {
-          const active = () => currentKey() === preset && !editingCustom();
+      <For each={board.projects}>
+        {(proj) => {
+          const active = () => currentKey() === proj.id && !editingCustom();
           return (
             <button
               type="button"
+              title={proj.description ? `${proj.name} — ${proj.description}` : proj.name}
               onClick={() => {
                 setEditingCustom(false);
-                props.onChange(active() ? null : preset);
+                props.onChange(active() ? null : proj.id);
               }}
               aria-pressed={active()}
               class={`inline-flex items-center gap-1 rounded-full border font-mono font-medium transition-colors ${pillSize()} ${
@@ -481,7 +594,7 @@ export function RepoPicker(props: {
                   : 'border-transparent bg-black/5 text-slate-600 hover:bg-black/10 dark:bg-white/5 dark:text-zinc-400 dark:hover:bg-white/10'
               }`}
             >
-              <span>{preset}</span>
+              <span>{proj.name}</span>
             </button>
           );
         }}
@@ -510,13 +623,29 @@ export function RepoPicker(props: {
       <Show
         when={editingCustom()}
         fallback={
-          <button
-            type="button"
-            onClick={openCustom}
-            class={`inline-flex items-center gap-1 rounded-full border border-dashed border-slate-300 font-medium text-slate-500 transition-colors hover:border-slate-400 hover:text-slate-700 dark:border-zinc-700 dark:text-zinc-400 dark:hover:border-zinc-500 dark:hover:text-zinc-200 ${pillSize()}`}
-          >
-            {isCustomActive() ? '✎ Edit' : '+ Custom…'}
-          </button>
+          <>
+            <button
+              type="button"
+              onClick={openCustom}
+              class={`inline-flex items-center gap-1 rounded-full border border-dashed border-slate-300 font-medium text-slate-500 transition-colors hover:border-slate-400 hover:text-slate-700 dark:border-zinc-700 dark:text-zinc-400 dark:hover:border-zinc-500 dark:hover:text-zinc-200 ${pillSize()}`}
+            >
+              {isCustomActive() ? '✎ Edit' : '+ Custom…'}
+            </button>
+            <Show when={!compact()}>
+              <button
+                type="button"
+                onClick={() =>
+                  setProjectModalState({
+                    mode: 'create',
+                    onCreated: (p) => props.onChange(p.id),
+                  })
+                }
+                class={`inline-flex items-center gap-1 rounded-full border border-sky-300/80 bg-sky-50 font-medium text-sky-700 transition-colors hover:bg-sky-100 dark:border-sky-500/30 dark:bg-sky-500/10 dark:text-sky-300 dark:hover:bg-sky-500/20 ${pillSize()}`}
+              >
+                + Proje
+              </button>
+            </Show>
+          </>
         }
       >
         <div class="inline-flex items-center gap-1">

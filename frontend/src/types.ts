@@ -35,9 +35,54 @@ export interface Column {
   position: number;
 }
 
+export interface ProjectLink {
+  label: string;
+  url: string;
+}
+
+export interface Project {
+  id: string;
+  name: string;
+  description: string | null;
+  links: ProjectLink[];
+  updated_at: string;
+}
+
+export interface ProjectInput {
+  id?: string;
+  name: string;
+  description?: string | null;
+  links?: ProjectLink[];
+}
+
+export type ProjectPatch = Partial<Pick<ProjectInput, 'name' | 'description' | 'links'>>;
+
+export type AssigneeKind = 'human' | 'ai';
+
+export interface AssigneeMember {
+  id: string;
+  name: string;
+  kind: AssigneeKind;
+  role_description: string | null;
+  avatar_badge: string | null;
+  updated_at: string;
+}
+
+export interface AssigneeInput {
+  id?: string;
+  name: string;
+  kind: AssigneeKind;
+  role_description?: string | null;
+  avatar_badge?: string | null;
+}
+
+export type AssigneePatch = Partial<Pick<AssigneeInput, 'name' | 'kind' | 'role_description' | 'avatar_badge'>>;
+
 export interface BoardResponse {
   title: string;
   columns: (Column & { cards: Card[] })[];
+  projects?: Project[];
+  assignees?: AssigneeMember[];
 }
 
 export type CardPatch = Partial<
@@ -49,6 +94,10 @@ export type CardPatch = Partial<
 export type WsEvent =
   | { type: 'CARD_CREATED' | 'CARD_MOVED' | 'CARD_UPDATED'; card: Card; origin: string | null }
   | { type: 'CARD_DELETED'; id: string; origin: string | null }
+  | { type: 'PROJECT_CREATED' | 'PROJECT_UPDATED'; project: Project; origin: string | null }
+  | { type: 'PROJECT_DELETED'; id: string; origin: string | null }
+  | { type: 'ASSIGNEE_CREATED' | 'ASSIGNEE_UPDATED'; assignee: AssigneeMember; origin: string | null }
+  | { type: 'ASSIGNEE_DELETED'; id: string; origin: string | null }
   | { type: 'HELLO' }
   | { type: 'RESYNC' };
 

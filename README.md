@@ -30,7 +30,7 @@ frontend/  SolidJS · TypeScript · Vite · Tailwind CSS v4
 | **Shortcuts** | `N` opens quick add. `Esc` closes dialogs. In quick add, `#sell` / `#ops` and `@agent` set the tag and assignee. |
 | **Agent HTTP endpoint** | `POST /api/agent/action` takes `start` / `complete` / `note` and accepts 8-character short ids. |
 | **Telegram bot** | `/board`, `/add`, `/ratio`, and plain-text quick add. Inline buttons move, reassign and delete cards. You get a notification when an agent finishes a task. |
-| **MCP server** | `POST /mcp` (Streamable HTTP) and `GET /mcp/sse` (legacy SSE) with 9 tools (`list_tasks`, `get_task_details`, `update_task_status`, `add_task_comment`, plus board helpers). Autonomous agents (Hermes, Antigravity, Claude Code, Cursor) can claim work, log progress and close tasks. |
+| **MCP server** | `POST /mcp` (Streamable HTTP) and `GET /mcp/sse` (legacy SSE) with 14 tools (`list_tasks`, `get_task_details`, `update_task_status`, `add_task_comment`, `list_projects`, `get_project_details`, `list_assignees`, plus board & workspace helpers). Autonomous agents (Hermes, Antigravity, Claude Code, Cursor) can inspect project context, team roles, claim work, log progress and close tasks. |
 
 ## Architecture
 
@@ -143,6 +143,11 @@ When an agent completes a card, the bot sends `🤖 Agent completed: "…" -> Mo
 | `move_card` | `card_id`, `target_column` | Moves the card and broadcasts `CARD_MOVED`. Moving to Done also notifies Telegram. |
 | `update_card_notes` | `card_id`, `note`, `append?` (true) | Appends a timestamped note, or replaces the description when `append` is false. Broadcasts `CARD_UPDATED`. |
 | `pick_next_agent_task` | — | Returns the agent's card that is already in Build. Otherwise it moves the top agent card in Backlog to Build and notifies Telegram. |
+| `list_projects` | — | Lists all defined projects/workspaces with their descriptions and resource link lists. |
+| `get_project_details` | `project` | Returns the full description and resource links for a project by ID (slug) or name (case-insensitive). |
+| `list_assignees` | `kind?` (`human` \| `ai`) | Lists all human team members and AI agents with their kind, role descriptions, and badges. |
+| `create_project` | `name`, `id?`, `description?`, `links?` | Creates a new project/workspace and broadcasts `PROJECT_CREATED`. |
+| `create_assignee` | `name`, `kind`, `id?`, `role_description?`, `avatar_badge?` | Registers a new human team member or AI agent and broadcasts `ASSIGNEE_CREATED`. |
 
 The intended loop is: `list_tasks` (or `pick_next_agent_task`) → `get_task_details` → `update_task_status` (`in_progress`) → work → `add_task_comment` (commit, PR link) → `update_task_status` (`review` or `done`, with `pr_url`).
 
@@ -157,17 +162,21 @@ curl -s localhost:3001/mcp -H 'Content-Type: application/json' -H "Authorization
 
 | Method | Path | Body / response |
 |---|---|---|
-| GET | `/api/board` | `{ title, columns: [{ id, title, position, cards: [...] }] }`, cards sorted by position |
+| GET | `/api/board` | `{ title, columns: [{ id, title, position, cards: [...] }], projects, assignees }` |
 | POST | `/api/cards` | `{ column_id, title, tag?, assignee?, description?, position?, id? }` → `201` + card |
 | PATCH | `/api/cards/:id` | Any of `{ column_id, position, title, description, tag, assignee }`. An empty `description` clears it. |
 | DELETE | `/api/cards/:id` | `204` |
+| GET / POST | `/api/projects` | List projects or create `{ name, id?, description?, links? }` → `201` + project |
+| PUT / DELETE | `/api/projects/:id` | Update `{ name?, description?, links? }` or delete project (`204`) |
+| GET / POST | `/api/assignees` | List team members/agents or create `{ name, kind, id?, role_description?, avatar_badge? }` → `201` + assignee |
+| PUT / DELETE | `/api/assignees/:id` | Update `{ name?, kind?, role_description?, avatar_badge? }` or delete (`204`) |
 | POST | `/api/agent/action` | `{ card_id, action: "start" \| "complete" \| "note", note? }` |
-| WS | `/ws` | Server → client: `{ type, card \| id, origin }` |
+| WS | `/ws` | Server → client: `{ type, card \| project \| assignee \| id, origin }` |
 | POST | `/mcp` | MCP JSON-RPC 2.0 (Streamable HTTP) |
 | GET | `/healthz` | `ok`, no auth (for health checks) |
 | GET / POST | `/mcp/sse`, `/mcp/messages?sessionId=` | MCP legacy SSE transport |
 
-- **WebSocket event types:** `CARD_CREATED`, `CARD_MOVED`, `CARD_UPDATED`, `CARD_DELETED`. The server also sends `HELLO` on connect and `RESYNC` when a client falls behind and should reload the board.
+- **WebSocket event types:** `CARD_CREATED`, `CARD_MOVED`, `CARD_UPDATED`, `CARD_DELETED`, `PROJECT_CREATED`, `PROJECT_UPDATED`, `PROJECT_DELETED`, `ASSIGNEE_CREATED`, `ASSIGNEE_UPDATED`, `ASSIGNEE_DELETED`. The server also sends `HELLO` on connect and `RESYNC` when a client falls behind and should reload the board.
 - **`origin`:** the browser tab's `X-Client-Id`, or `"telegram"` / `"mcp"` for changes from those sources.
 - **Allowed values:** columns are `backlog`, `build`, `sell`, `done`. Tags are `build`, `sell`, `ops`. Assignees accept `"human"`, `"agent"`, or specific agent names such as `"antigravity"` and `"hermes"`. Statuses are `todo`, `in_progress`, `review`, `sell`, `done`.
 - **Errors:** returned as `{ "error": "…" }` with status 400, 404 or 422.
@@ -182,7 +191,7 @@ backend/src/
   routes.rs     Thin REST handlers over service
   ws.rs         /ws: forwards broadcast events, heartbeat, RESYNC on lag
   telegram.rs   Bot: long polling, commands, inline buttons, notifications
-  mcp.rs        MCP server: JSON-RPC, both transports, SHIPMD_MCP_TOKEN bearer auth, 9 tools
+  mcp.rs        MCP server: JSON-RPC, both transports, SHIPMD_MCP_TOKEN bearer auth, 14 tools
   db.rs         Schema, WAL setup, idempotent migrations, seed data, column list
   models.rs     Card / Column / request types
   error.rs      AppError → JSON HTTP errors
